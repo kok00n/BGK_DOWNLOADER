@@ -289,6 +289,80 @@ FROM bgk_with_kind b;
 
 COMMENT ON VIEW v_bgk_auction_spread IS
     'BGK FPC PLN per-auction spread vs POLGB curve in basis points. '
-    'Fixed-coupon bonds: yield-space spread. Floaters: DM-space spread '
-    '(zero-coupon equivalent from price). NULL when POLGB curve does '
-    'not bracket the BGK tenor (we do not extrapolate).';
+    'Source: bgk_auction_results (PDF auctions). FPC only because other '
+    'BGK programs (KFD/FP/FWSZ/własne) place privately and have no public '
+    'auction PDFs. Use v_bgk_issuance_spread for broader program coverage.';
+
+-- =====================================================================
+--  VIEW: per-issuance spread vs POLGB curve, ANY PLN program.
+--  Source: bgk_auctions (XLSX = canonical list of all issuance events,
+--  public auctions + private placements). FPC/KFD/FP/FWSZ/własne all
+--  covered, since XLSX carries price + yield + coupon margin for every row.
+--
+--  Use this for cross-program time-series (e.g. funding cost trends across
+--  KFD vs FPC vs FWSZ). Use v_bgk_auction_spread when you need exact
+--  auction-day numbers and B/C metrics (FPC only).
+-- =====================================================================
+DROP VIEW IF EXISTS v_bgk_issuance_spread;
+CREATE OR REPLACE VIEW v_bgk_issuance_spread AS
+WITH base AS (
+    SELECT
+        a.issue_date,
+        a.series,
+        a.isin,
+        a.maturity_date,
+        a.program,
+        a.currency,
+        a.coupon_kind        AS bgk_coupon_kind,
+        a.coupon_margin_bp   AS bgk_margin_bp,
+        a.coupon_ref_rate    AS bgk_ref_rate,
+        a.issue_amount,
+        a.price_pct          AS bgk_price_pct,
+        a.yield_pct          AS bgk_yield_pct,
+        (a.maturity_date - a.issue_date)::NUMERIC / 365.25 AS tenor_years
+    FROM bgk_auctions a
+    WHERE a.currency = 'PLN'                        -- POLGB curve is PLN-only
+      AND a.maturity_date > a.issue_date
+)
+SELECT
+    b.*,
+    -- Floater price-implied DM
+    CASE
+        WHEN b.bgk_coupon_kind = 'zmienne'
+             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0
+        THEN (POWER(100.0 / b.bgk_price_pct,
+                    365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
+    END AS bgk_implied_dm_pct,
+    -- Floater true DM = price-implied + margin from XLSX 'Kupon' string
+    CASE
+        WHEN b.bgk_coupon_kind = 'zmienne'
+             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0
+             AND b.bgk_margin_bp IS NOT NULL
+        THEN (POWER(100.0 / b.bgk_price_pct,
+                    365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
+             + (b.bgk_margin_bp / 100.0)
+    END AS bgk_true_dm_pct,
+    polgb_yield_interp(b.issue_date, b.tenor_years)        AS polgb_yield_at_tenor,
+    polgb_floater_dm_interp(b.issue_date, b.tenor_years)   AS polgb_floater_dm_at_tenor,
+    -- Spread:
+    -- Floater w/ known margin: bgk_true_DM - POLGB WZ implied DM, in bp.
+    -- Fixed-coupon: bgk_yield_pct - POLGB nominal interp, in bp.
+    CASE
+        WHEN b.bgk_coupon_kind = 'zmienne'
+             AND b.bgk_margin_bp IS NOT NULL
+             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0 THEN
+            (
+                ((POWER(100.0 / b.bgk_price_pct,
+                        365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
+                 + (b.bgk_margin_bp / 100.0))
+                - polgb_floater_dm_interp(b.issue_date, b.tenor_years)
+            ) * 100
+        WHEN b.bgk_yield_pct IS NOT NULL THEN
+            (b.bgk_yield_pct - polgb_yield_interp(b.issue_date, b.tenor_years)) * 100
+    END AS spread_bp
+FROM base b;
+
+COMMENT ON VIEW v_bgk_issuance_spread IS
+    'BGK per-issuance-event spread vs POLGB curve (bp), all PLN programs. '
+    'Source: bgk_auctions XLSX. Use for cross-program time-series. '
+    'v_bgk_auction_spread is FPC-only with auction-day PDF precision.';
