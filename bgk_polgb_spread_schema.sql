@@ -38,12 +38,27 @@
 -- with "cannot drop function because other objects depend on it". Both
 -- spread views reference polgb_*_interp.
 --
--- Both DROP MATERIALIZED VIEW and DROP VIEW listed, idempotent - one of
--- them will succeed depending on what the previous deploy created.
-DROP MATERIALIZED VIEW IF EXISTS v_bgk_issuance_spread CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS v_bgk_auction_spread  CASCADE;
-DROP VIEW              IF EXISTS v_bgk_issuance_spread CASCADE;
-DROP VIEW              IF EXISTS v_bgk_auction_spread  CASCADE;
+-- Older deploys may have these as regular views; newer ones as materialised
+-- views. `DROP {VIEW|MATERIALIZED VIEW} IF EXISTS` raises 42809 if the
+-- object exists as the wrong kind, so we check pg_class first and dispatch.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class
+               WHERE relname = 'v_bgk_issuance_spread' AND relkind = 'm') THEN
+        DROP MATERIALIZED VIEW v_bgk_issuance_spread CASCADE;
+    ELSIF EXISTS (SELECT 1 FROM pg_class
+                  WHERE relname = 'v_bgk_issuance_spread' AND relkind = 'v') THEN
+        DROP VIEW v_bgk_issuance_spread CASCADE;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_class
+               WHERE relname = 'v_bgk_auction_spread' AND relkind = 'm') THEN
+        DROP MATERIALIZED VIEW v_bgk_auction_spread CASCADE;
+    ELSIF EXISTS (SELECT 1 FROM pg_class
+                  WHERE relname = 'v_bgk_auction_spread' AND relkind = 'v') THEN
+        DROP VIEW v_bgk_auction_spread CASCADE;
+    END IF;
+END $$;
+
 DROP FUNCTION IF EXISTS bgk_refresh_spreads();
 DROP FUNCTION IF EXISTS polgb_floater_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_dm_interp(DATE, NUMERIC);
