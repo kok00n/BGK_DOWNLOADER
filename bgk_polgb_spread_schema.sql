@@ -26,24 +26,32 @@
 --   4. For fixed-coupon BGK bonds: spread_bp = (bgk_yield - polgb_interp_yield) * 100
 --   5. For floater BGK bonds (bgk_auctions.coupon_kind = 'zmienne'):
 --      compute implied DM = (POWER(100/price, 365.25/days) - 1) * 100
---      both for BGK auction and POLGB curve, then spread_dm_bp.
---      This is the same "zero-coupon-equivalent" technique CETO uses
---      for MF floaters (WZ/NZ) - it ignores reset cashflows but the
---      bias cancels when comparing two bonds quoted the same way.
+--      both sides, then spread_dm_bp. Crucially, the POLGB side uses
+--      the **WZ curve** (coupon_kind='Z' POLGB floaters), NOT the
+--      fixed-coupon curve - apples-to-apples since BGK FPC floaters
+--      are WIBOR/POLSTR-referenced just like POLGB WZ. CETO uses the
+--      same trick for MF WZ/NZ floaters - the implied-DM formula
+--      ignores reset cashflows but the bias cancels when both sides
+--      are computed identically.
 
 DROP VIEW IF EXISTS v_bgk_auction_spread;
+DROP FUNCTION IF EXISTS polgb_floater_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_yield_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_curve_at(DATE);
 
 -- =====================================================================
---  FUNCTION: POLGB nominal yield curve points at an arbitrary date.
---  One row per active POLGB bond on p_date, with its latest valid
---  fixing per the leakage-safe pick rule.
+--  FUNCTION: POLGB curve points at an arbitrary date - ALL bond types.
+--  One row per active POLGB bond on p_date, with its latest leakage-safe
+--  fixing. Returns coupon_kind so callers can filter:
+--    'S' / 'O' -> nominal yield curve  (used by polgb_yield_interp)
+--    'Z'       -> floater DM curve     (used by polgb_floater_dm_interp)
+--    'I'       -> inflation-linked (excluded - real-yield space, not used)
 -- =====================================================================
 CREATE OR REPLACE FUNCTION polgb_curve_at(p_date DATE)
 RETURNS TABLE (
     polgb_isin     VARCHAR(12),
+    coupon_kind    CHAR(1),
     fixing_date    DATE,
     fixing_session SMALLINT,
     tenor_years    NUMERIC,
@@ -54,13 +62,15 @@ RETURNS TABLE (
 LANGUAGE sql STABLE AS $$
     SELECT
         b.isin AS polgb_isin,
+        b.coupon_kind,
         fx.fixing_date,
         fx.fixing_session,
         (b.maturity_date - p_date)::NUMERIC / 365.25 AS tenor_years,
         fx.fixing_yield,
         fx.fixing_price,
-        -- Implied DM = zero-coupon-equivalent yield back-solved from price.
-        -- Used as the "yield" for floater-vs-floater comparisons.
+        -- Implied DM = zero-coupon-equivalent yield back-solved from clean price.
+        -- Meaningful for WZ floaters (relative measure of cheapness vs par),
+        -- noisy for fixed-coupon bonds (since they have a real coupon).
         CASE
             WHEN fx.fixing_price IS NOT NULL AND fx.fixing_price > 0
                  AND b.maturity_date > p_date
@@ -81,9 +91,11 @@ LANGUAGE sql STABLE AS $$
         ORDER BY f.fixing_date DESC, f.fixing_session DESC
         LIMIT 1
     ) fx ON TRUE
-    WHERE b.coupon_kind IN ('S', 'O')        -- fixed + zero-coupon only
+    WHERE b.coupon_kind IN ('S', 'O', 'Z')   -- fixed + zero + floaters
       AND b.maturity_date > p_date
-      AND fx.fixing_yield IS NOT NULL;       -- need a real yield quote
+      -- Need either a yield quote (S/O for nominal curve) OR a price
+      -- (Z floaters for DM curve - BondSpot doesn't quote YTM for WZ).
+      AND (fx.fixing_yield IS NOT NULL OR fx.fixing_price IS NOT NULL);
 $$;
 
 -- =====================================================================
@@ -98,7 +110,8 @@ LANGUAGE sql STABLE AS $$
     WITH curve AS (
         SELECT tenor_years, fixing_yield
         FROM polgb_curve_at(p_date)
-        WHERE fixing_yield IS NOT NULL
+        WHERE coupon_kind IN ('S', 'O')     -- nominal yield curve only
+          AND fixing_yield IS NOT NULL
     ),
     bracket AS (
         SELECT
@@ -120,17 +133,24 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- =====================================================================
---  FUNCTION: linear-interpolate POLGB implied-DM at a target tenor.
---  Same shape as polgb_yield_interp but using the implied_dm_pct column
---  derived from prices. Used for floater BGK bond spreads.
+--  FUNCTION: linear-interpolate POLGB FLOATER (WZ) implied-DM at a tenor.
+--  Filters to coupon_kind='Z' only - the floater curve. Used to compute
+--  spread for BGK floater auctions (FPC0332 etc., which reference
+--  WIBOR/POLSTR same as POLGB WZ).
+--
+--  Earlier version of this schema mistakenly interpolated implied-DM over
+--  the *fixed-coupon* curve, which gave absurd negative spreads (BGK
+--  floater ~4% DM vs POLGB-fixed-bond zero-coupon-equivalent ~0.5%);
+--  fixed in this revision.
 -- =====================================================================
-CREATE OR REPLACE FUNCTION polgb_dm_interp(p_date DATE, p_tenor_years NUMERIC)
+CREATE OR REPLACE FUNCTION polgb_floater_dm_interp(p_date DATE, p_tenor_years NUMERIC)
 RETURNS NUMERIC
 LANGUAGE sql STABLE AS $$
     WITH curve AS (
         SELECT tenor_years, implied_dm_pct
         FROM polgb_curve_at(p_date)
-        WHERE implied_dm_pct IS NOT NULL
+        WHERE coupon_kind = 'Z'             -- floaters only (WZ/NZ)
+          AND implied_dm_pct IS NOT NULL
     ),
     bracket AS (
         SELECT
@@ -187,11 +207,12 @@ SELECT
         THEN (POWER(100.0 / b.stop_price,
                     365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
     END AS bgk_implied_dm_pct,
-    -- POLGB curve point at the BGK tenor
-    polgb_yield_interp(b.auction_date, b.tenor_years) AS polgb_yield_at_tenor,
-    polgb_dm_interp(b.auction_date, b.tenor_years)    AS polgb_dm_at_tenor,
-    -- Spread in basis points. Use DM space for floaters, yield space
-    -- for everything else with a quoted yield.
+    -- POLGB curve points at the BGK tenor: nominal yield for fixed-coupon
+    -- BGK, floater DM for floater BGK. Both interpolated linearly.
+    polgb_yield_interp(b.auction_date, b.tenor_years)        AS polgb_yield_at_tenor,
+    polgb_floater_dm_interp(b.auction_date, b.tenor_years)   AS polgb_floater_dm_at_tenor,
+    -- Spread in basis points. Floater BGK -> DM-space vs POLGB WZ curve.
+    -- Fixed-coupon BGK -> yield-space vs POLGB nominal curve.
     CASE
         WHEN b.bgk_coupon_kind = 'zmienne' THEN
             (
@@ -201,7 +222,7 @@ SELECT
                     THEN (POWER(100.0 / b.stop_price,
                                 365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
                 END
-                - polgb_dm_interp(b.auction_date, b.tenor_years)
+                - polgb_floater_dm_interp(b.auction_date, b.tenor_years)
             ) * 100
         WHEN b.yield_pct IS NOT NULL THEN
             (b.yield_pct - polgb_yield_interp(b.auction_date, b.tenor_years)) * 100
