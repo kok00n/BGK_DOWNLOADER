@@ -148,6 +148,14 @@ $$;
 --  Used to compute spread for BGK floater auctions - BGK FPC floaters
 --  are WIBOR-referenced, so comparison must be vs WZ only.
 --
+--  Allows linear extrapolation up to 1 year past the curve's longest
+--  WZ tenor (longer than the nominal-curve helper, where we don't
+--  extrapolate). Reason: BondSpot WZ universe is shallow (longest
+--  active WZ ~5.5Y as of 2026-05); FPC PLN floaters routinely sit
+--  0.1-1Y past that, and NULL'ing them all out loses too much signal.
+--  The 1Y bound keeps wild extrapolations off the dashboard - anything
+--  further (e.g. FPC1140 at 14Y) still returns NULL.
+--
 --  Earlier revisions of this schema (a) interpolated over fixed-coupon
 --  bonds (apple/orange), then (b) over all floaters including NZ
 --  (WIBOR/POLSTR mix); both produced wrong spreads, now fixed.
@@ -163,19 +171,40 @@ LANGUAGE sql STABLE AS $$
     ),
     bracket AS (
         SELECT
+            -- Largest tenor <= target (lower bracket / extrapolation anchor).
             (SELECT tenor_years    FROM curve WHERE tenor_years <= p_tenor_years
              ORDER BY tenor_years DESC LIMIT 1) AS t_lo,
             (SELECT implied_dm_pct FROM curve WHERE tenor_years <= p_tenor_years
              ORDER BY tenor_years DESC LIMIT 1) AS y_lo,
+            -- Smallest tenor >= target (upper bracket).
             (SELECT tenor_years    FROM curve WHERE tenor_years >= p_tenor_years
              ORDER BY tenor_years ASC LIMIT 1) AS t_hi,
             (SELECT implied_dm_pct FROM curve WHERE tenor_years >= p_tenor_years
-             ORDER BY tenor_years ASC LIMIT 1) AS y_hi
+             ORDER BY tenor_years ASC LIMIT 1) AS y_hi,
+            -- Second-largest tenor in curve - needed to compute the slope
+            -- of the last segment when extrapolating past the end.
+            (SELECT tenor_years    FROM curve
+             ORDER BY tenor_years DESC OFFSET 1 LIMIT 1) AS t_max_prev,
+            (SELECT implied_dm_pct FROM curve
+             ORDER BY tenor_years DESC OFFSET 1 LIMIT 1) AS y_max_prev
     )
     SELECT CASE
-        WHEN t_lo IS NULL OR t_hi IS NULL THEN NULL
-        WHEN t_lo = t_hi THEN y_lo
-        ELSE y_lo + (y_hi - y_lo) * (p_tenor_years - t_lo) / (t_hi - t_lo)
+        -- Empty curve / no anchor.
+        WHEN t_lo IS NULL THEN NULL
+        -- Normal bracket: standard linear interp.
+        WHEN t_hi IS NOT NULL THEN
+            CASE WHEN t_lo = t_hi THEN y_lo
+                 ELSE y_lo + (y_hi - y_lo) * (p_tenor_years - t_lo) / (t_hi - t_lo)
+            END
+        -- Past the longest point: extrapolate using last-segment slope,
+        -- but only within 1Y of the curve end and only if we have
+        -- 2+ curve points to compute a slope.
+        WHEN t_hi IS NULL
+             AND p_tenor_years - t_lo <= 1.0
+             AND t_max_prev IS NOT NULL
+             AND t_lo <> t_max_prev
+        THEN y_lo + (y_lo - y_max_prev) / (t_lo - t_max_prev) * (p_tenor_years - t_lo)
+        ELSE NULL
     END
     FROM bracket;
 $$;
