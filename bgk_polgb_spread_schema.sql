@@ -34,6 +34,10 @@
 --      ignores reset cashflows but the bias cancels when both sides
 --      are computed identically.
 
+-- Drop dependent views FIRST so the subsequent function drops don't error
+-- with "cannot drop function because other objects depend on it". Both
+-- views reference polgb_*_interp, so both must go before functions.
+DROP VIEW IF EXISTS v_bgk_issuance_spread;
 DROP VIEW IF EXISTS v_bgk_auction_spread;
 DROP FUNCTION IF EXISTS polgb_floater_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_dm_interp(DATE, NUMERIC);
