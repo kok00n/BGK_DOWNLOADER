@@ -414,15 +414,19 @@ CREATE INDEX IF NOT EXISTS idx_v_bgk_issuance_spread_series
 -- =====================================================================
 --  FUNCTION: bgk_refresh_spreads() - one-shot refresh of both spread
 --  materialised views, callable from workflows or the SQL editor.
---  Uses CONCURRENTLY so readers (dashboard, notebook) keep working
---  during refresh; relies on the unique indexes above.
+--
+--  We use plain (non-CONCURRENT) REFRESH because the workflow flow is
+--  sequential (refresh -> render) and there are no concurrent readers
+--  during the brief refresh window. CONCURRENTLY hit transient HTTP 500s
+--  from PostgREST under some Supabase plpgsql contexts; plain REFRESH
+--  is reliable and only blocks readers for ~10-30s which is fine.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION bgk_refresh_spreads()
 RETURNS TEXT
 LANGUAGE plpgsql AS $$
 BEGIN
-    REFRESH MATERIALIZED VIEW CONCURRENTLY v_bgk_auction_spread;
-    REFRESH MATERIALIZED VIEW CONCURRENTLY v_bgk_issuance_spread;
+    REFRESH MATERIALIZED VIEW v_bgk_auction_spread;
+    REFRESH MATERIALIZED VIEW v_bgk_issuance_spread;
     RETURN 'refreshed at ' || now();
 END;
 $$;
