@@ -43,15 +43,21 @@ DROP FUNCTION IF EXISTS polgb_curve_at(DATE);
 -- =====================================================================
 --  FUNCTION: POLGB curve points at an arbitrary date - ALL bond types.
 --  One row per active POLGB bond on p_date, with its latest leakage-safe
---  fixing. Returns coupon_kind so callers can filter:
---    'S' / 'O' -> nominal yield curve  (used by polgb_yield_interp)
---    'Z'       -> floater DM curve     (used by polgb_floater_dm_interp)
---    'I'       -> inflation-linked (excluded - real-yield space, not used)
+--  fixing. Returns both coupon_kind and bond_type so callers can filter:
+--    coupon_kind 'S' / 'O', bond_type any  -> nominal yield curve
+--    bond_type 'WZ' (WIBOR floater)        -> WIBOR-based DM curve
+--    bond_type 'NZ' (POLSTR floater)       -> POLSTR-based DM curve, separate
+--    coupon_kind 'I'                       -> inflation-linked, real-yield space
+--
+--  WZ and NZ live in DIFFERENT discount-margin spaces (WIBOR vs POLSTR
+--  benchmarks) - mixing them in one curve biases the result. BGK FPC
+--  floaters reference WIBOR, so spread should be computed vs WZ curve only.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION polgb_curve_at(p_date DATE)
 RETURNS TABLE (
     polgb_isin     VARCHAR(12),
     coupon_kind    CHAR(1),
+    bond_type      TEXT,
     fixing_date    DATE,
     fixing_session SMALLINT,
     tenor_years    NUMERIC,
@@ -63,6 +69,7 @@ LANGUAGE sql STABLE AS $$
     SELECT
         b.isin AS polgb_isin,
         b.coupon_kind,
+        b.bond_type,
         fx.fixing_date,
         fx.fixing_session,
         (b.maturity_date - p_date)::NUMERIC / 365.25 AS tenor_years,
@@ -133,15 +140,17 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- =====================================================================
---  FUNCTION: linear-interpolate POLGB FLOATER (WZ) implied-DM at a tenor.
---  Filters to coupon_kind='Z' only - the floater curve. Used to compute
---  spread for BGK floater auctions (FPC0332 etc., which reference
---  WIBOR/POLSTR same as POLGB WZ).
+--  FUNCTION: linear-interpolate POLGB WZ (WIBOR-floater) implied-DM at a tenor.
+--  Filters to bond_type='WZ' only - excludes NZ (POLSTR-floaters) because
+--  WIBOR and POLSTR are different benchmarks and their DMs live in
+--  separate spaces; mixing them gives a biased curve.
 --
---  Earlier version of this schema mistakenly interpolated implied-DM over
---  the *fixed-coupon* curve, which gave absurd negative spreads (BGK
---  floater ~4% DM vs POLGB-fixed-bond zero-coupon-equivalent ~0.5%);
---  fixed in this revision.
+--  Used to compute spread for BGK floater auctions - BGK FPC floaters
+--  are WIBOR-referenced, so comparison must be vs WZ only.
+--
+--  Earlier revisions of this schema (a) interpolated over fixed-coupon
+--  bonds (apple/orange), then (b) over all floaters including NZ
+--  (WIBOR/POLSTR mix); both produced wrong spreads, now fixed.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION polgb_floater_dm_interp(p_date DATE, p_tenor_years NUMERIC)
 RETURNS NUMERIC
@@ -149,7 +158,7 @@ LANGUAGE sql STABLE AS $$
     WITH curve AS (
         SELECT tenor_years, implied_dm_pct
         FROM polgb_curve_at(p_date)
-        WHERE coupon_kind = 'Z'             -- floaters only (WZ/NZ)
+        WHERE bond_type = 'WZ'              -- WIBOR floaters only (no NZ/POLSTR)
           AND implied_dm_pct IS NOT NULL
     ),
     bracket AS (
