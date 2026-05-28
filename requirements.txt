@@ -2,8 +2,3 @@ requests==2.32.3
 openpyxl==3.1.5
 python-dateutil==2.9.0
 beautifulsoup4==4.12.3
-# Playwright drives headless Chromium to navigate Cloudflare's Turnstile
-# challenge on the BGK Statystyka page. Plain requests / curl_cffi with
-# Chrome JA3 impersonation both get HTTP 403 cf-mitigated:challenge from
-# Azure (GH Actions) IPs - the challenge requires JS execution.
-playwright==1.50.0

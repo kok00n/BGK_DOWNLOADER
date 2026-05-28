@@ -16,7 +16,7 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -29,26 +29,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # Cache Chromium binaries across runs - install --with-deps downloads
-      # ~150MB which is the bulk of the workflow time.
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright browser
-        run: |
-          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
-            # Cached binaries don't include the apt system libs - install only those.
-            python -m playwright install-deps chromium
-          else
-            python -m playwright install --with-deps chromium
-          fi
-
       - name: Refresh BGK XLSX
         env:
+          # Supabase target (shared with CETO_DOWNLOADER, bgk_* prefix).
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # ScrapingBee handles Cloudflare Turnstile bypass for bgk.pl
+          # (residential proxy + JS render); plain requests / curl_cffi /
+          # Playwright stealth all failed from Azure IPs.
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_xlsx.py
