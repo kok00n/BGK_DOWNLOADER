@@ -23,6 +23,7 @@ import re
 from datetime import date, datetime
 from io import BytesIO
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 
@@ -30,9 +31,49 @@ BGK_BASE = "https://www.bgk.pl"
 BGK_STATS_PAGE = f"{BGK_BASE}/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/"
 
 # How long to wait for Cloudflare's Turnstile challenge to resolve. The
-# challenge JS typically clears in 5-15s on a real browser; 60s is a
-# safety margin for slow runs.
-_CHALLENGE_TIMEOUT_MS = 60_000
+# challenge JS typically clears in 5-15s on a real browser; 90s is a
+# safety margin for slow runs / harder challenge variants.
+_CHALLENGE_TIMEOUT_MS = 90_000
+
+# Inline stealth init script: patches the most reliable headless-detection
+# tells (navigator.webdriver, missing chrome.runtime, empty plugins,
+# default languages). Equivalent to what playwright-stealth applies for
+# these properties; we inline to avoid adding a dependency that has had
+# maintenance churn lately.
+_STEALTH_INIT_JS = """
+() => {
+    // navigator.webdriver === true is the canonical "I'm automated" tell.
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // Real Chrome exposes window.chrome with runtime; headless lacks it.
+    window.chrome = window.chrome || { runtime: {} };
+
+    // Plugins array empty in headless; real Chrome has at least PDF viewer.
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+            { name: 'Chrome PDF Plugin' },
+            { name: 'Chrome PDF Viewer' },
+            { name: 'Native Client' },
+        ],
+    });
+
+    // Languages list - we already set Accept-Language: pl-PL via headers,
+    // but JS-readable navigator.languages must match for consistency.
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['pl-PL', 'pl', 'en-US', 'en'],
+    });
+
+    // Permissions API: real Chrome resolves 'notifications' as 'default';
+    // headless sometimes returns 'denied' which Cloudflare keys on.
+    const origQuery = navigator.permissions && navigator.permissions.query;
+    if (origQuery) {
+        navigator.permissions.query = (params) =>
+            params && params.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission || 'default' })
+                : origQuery.call(navigator.permissions, params);
+    }
+}
+"""
 
 # Captures both href and the DD.MM.YYYY snapshot date so callers can log it.
 _XLSX_HREF_RE = re.compile(
@@ -71,11 +112,22 @@ def fetch_bgk_xlsx() -> tuple[BytesIO, str, date]:
     by the challenge is reused for the asset request.
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Args that reduce headless-detection surface area. --disable-blink-
+        # features=AutomationControlled is the canonical one (removes the
+        # CDP "automation" banner and the runtime.enable side channel).
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         try:
             context = browser.new_context(
                 locale="pl-PL",
                 timezone_id="Europe/Warsaw",
+                viewport={"width": 1280, "height": 800},
                 # Playwright's default UA contains "HeadlessChrome" which
                 # some WAFs flag. Override with the equivalent Chrome UA.
                 user_agent=(
@@ -87,22 +139,28 @@ def fetch_bgk_xlsx() -> tuple[BytesIO, str, date]:
                     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
                 },
             )
+            # Apply stealth patches BEFORE any page navigates. add_init_script
+            # injects into every page in the context, before site JS runs,
+            # so Cloudflare's bot detection sees patched values.
+            context.add_init_script(_STEALTH_INIT_JS)
+
             page = context.new_page()
             print(f"  -> navigating to {BGK_STATS_PAGE}", flush=True)
             page.goto(BGK_STATS_PAGE, wait_until="domcontentloaded",
                       timeout=_CHALLENGE_TIMEOUT_MS)
 
-            # The Cloudflare challenge serves a "Just a moment..." page,
-            # then JS-redirects to the real content. Wait until our
-            # target link appears in the DOM - that means challenge
-            # cleared AND page rendered (single condition for both).
             print("  -> waiting for Cloudflare challenge to clear and "
-                  "Baza_obligacji link to appear...", flush=True)
-            page.wait_for_function(
-                "() => document.querySelector("
-                "'a[href*=\"Baza_obligacji_strona_internetowa\"]') !== null",
-                timeout=_CHALLENGE_TIMEOUT_MS,
-            )
+                  "Baza_obligacji link to appear (up to 90s)...", flush=True)
+            try:
+                page.wait_for_function(
+                    "() => document.querySelector("
+                    "'a[href*=\"Baza_obligacji_strona_internetowa\"]') !== null",
+                    timeout=_CHALLENGE_TIMEOUT_MS,
+                )
+            except PlaywrightTimeout:
+                # Dump enough state to diagnose what CF is showing us.
+                _dump_page_state(page, "wait_for link timed out")
+                raise
 
             html = page.content()
             url, snapshot = _parse_xlsx_link(html)
@@ -131,3 +189,35 @@ def fetch_bgk_xlsx() -> tuple[BytesIO, str, date]:
             return BytesIO(xlsx_bytes), url, snapshot
         finally:
             browser.close()
+
+
+def _dump_page_state(page, reason: str) -> None:
+    """Print enough state at failure time to choose the next workaround.
+
+    Captures URL (did we redirect at all?), title (still "Just a moment..."?),
+    visible challenge frame presence, and a body snippet.
+    """
+    print(f"[bgk_xlsx] page state dump - {reason}", flush=True)
+    try:
+        print(f"  url: {page.url}", flush=True)
+    except Exception as e:
+        print(f"  url: <unreadable: {e}>", flush=True)
+    try:
+        print(f"  title: {page.title()!r}", flush=True)
+    except Exception as e:
+        print(f"  title: <unreadable: {e}>", flush=True)
+    try:
+        frames = page.frames
+        challenge_frames = [
+            f.url for f in frames
+            if "challenges.cloudflare.com" in (f.url or "")
+        ]
+        print(f"  total frames: {len(frames)}", flush=True)
+        print(f"  cloudflare challenge frames: {challenge_frames}", flush=True)
+    except Exception as e:
+        print(f"  frames: <unreadable: {e}>", flush=True)
+    try:
+        body = page.content()
+        print(f"  body[:1500]: {body[:1500]!r}", flush=True)
+    except Exception as e:
+        print(f"  body: <unreadable: {e}>", flush=True)
