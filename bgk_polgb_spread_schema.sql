@@ -423,7 +423,15 @@ CREATE INDEX IF NOT EXISTS idx_v_bgk_issuance_spread_series
 -- =====================================================================
 CREATE OR REPLACE FUNCTION bgk_refresh_spreads()
 RETURNS TEXT
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+-- PostgREST default statement_timeout (~3s for anon, longer for
+-- service_role but still finite); REFRESH MATERIALIZED VIEW non-conc
+-- regularly runs 30-90s for ~280-300 rows. Pin to 5min on the function
+-- so the planner uses it for every call, regardless of caller role
+-- defaults. Without this the RPC returns HTTP 500 to the workflow even
+-- though the function itself completes fine when called from SQL Editor.
+SET statement_timeout = '5min'
+AS $$
 BEGIN
     REFRESH MATERIALIZED VIEW v_bgk_auction_spread;
     REFRESH MATERIALIZED VIEW v_bgk_issuance_spread;

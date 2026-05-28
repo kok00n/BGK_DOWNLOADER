@@ -92,10 +92,21 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          curl -fsS -X POST "${SUPABASE_URL%/}/rest/v1/rpc/bgk_refresh_spreads" \
+          # Capture body + status separately so we can show the real
+          # PostgREST error message on failure (curl --fail hides it).
+          response=$(curl -sS -w "\nHTTP_STATUS:%{http_code}\n" --max-time 180 \
+            -X POST "${SUPABASE_URL%/}/rest/v1/rpc/bgk_refresh_spreads" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Content-Type: application/json" -d '{}'
+            -H "Content-Type: application/json" \
+            -H "Prefer: timeout=180" \
+            -d '{}')
+          echo "$response"
+          status=$(echo "$response" | grep -oP 'HTTP_STATUS:\K\d+' | tail -1)
+          if [[ "$status" != "200" ]]; then
+            echo "::error::bgk_refresh_spreads RPC failed (HTTP $status)"
+            exit 1
+          fi
 
       - name: Execute notebook -> HTML
         env:
