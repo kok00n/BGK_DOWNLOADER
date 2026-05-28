@@ -84,8 +84,23 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install notebook dependencies
-        run: pip install -r requirements-notebook.txt
+      - name: Install all dependencies
+        # Both refresh (requests/bs4/etc) and notebook (plotly/nbconvert/
+        # anthropic) deps - merged in one pip step.
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-notebook.txt
+
+      - name: Opportunistic XLSX refresh
+        # BGK XLSX Baza obligacji lags auction-day by ~1-7 days; if they
+        # uploaded a new snapshot since the Tue/Fri cron we catch it here
+        # so the dashboard reflects today's auction in skład długu /
+        # maturity ladder views. If no new XLSX, this is a fast no-op.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
+        run: python scripts/refresh_bgk_xlsx.py
 
       - name: Refresh spread materialised views
         env:
