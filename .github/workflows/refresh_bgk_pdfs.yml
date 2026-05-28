@@ -1,0 +1,38 @@
+name: refresh_bgk_pdfs
+
+# BGK auction-results PDF refresh.
+# New PDFs land on the komunikaty page ~2x/month. We poll twice a week
+# so a fresh PDF lands in DB within ~3 days. Uses ScrapingBee for CF bypass.
+
+on:
+  schedule:
+    # Wed + Sat 17:30 UTC (= 18/19 Europe/Warsaw depending on DST).
+    # Staggered vs refresh_bgk_xlsx (Tue+Fri) so we never run both at once.
+    - cron: "30 17 * * 3,6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh BGK auction-result PDFs (incremental)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
+        run: python scripts/refresh_bgk_pdfs.py
