@@ -1,0 +1,126 @@
+name: auction_day_pipeline
+
+# Daily check: is today a BGK auction day? If yes, run the full
+# refresh + render pipeline (refresh PDFs, REFRESH spread MVs, execute
+# notebook, deploy to GH Pages). If no, exit early so LLM commentary
+# tokens aren't burned on no-op days.
+#
+# Source of truth for "is today an auction day" is bgk_auction_calendar,
+# populated weekly by discover_auctions.yml.
+
+on:
+  schedule:
+    # 22:00 UTC daily = 23:00 Warsaw (winter, CET) / 24:00 (summer, CEST).
+    # Accept the 1h DST drift - BGK PDFs are reliably published by ~12:00
+    # CET on auction day, so even worst case (early summer 22:00 UTC =
+    # 00:00 next-day local) the PDF is long-since available.
+    - cron: "0 22 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      is_auction_day: ${{ steps.lookup.outputs.is_auction_day }}
+      auction_summary: ${{ steps.lookup.outputs.auction_summary }}
+    steps:
+      - id: lookup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          echo "Checking bgk_auction_calendar for ${today}..."
+          response=$(curl -fsS \
+            "${SUPABASE_URL%/}/rest/v1/bgk_auction_calendar?auction_date=eq.${today}&select=auction_date,series" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          echo "Calendar response: $response"
+          if [[ -z "$response" || "$response" == "[]" ]]; then
+            echo "is_auction_day=false" >> "$GITHUB_OUTPUT"
+            echo "auction_summary=no auctions on ${today}" >> "$GITHUB_OUTPUT"
+            echo "::notice::No BGK auction today (${today}). Skipping refresh + render."
+          else
+            echo "is_auction_day=true" >> "$GITHUB_OUTPUT"
+            echo "auction_summary=${response}" >> "$GITHUB_OUTPUT"
+            echo "::notice::BGK auction day (${today}). Running pipeline. ${response}"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Auction day check" >> "$GITHUB_STEP_SUMMARY"
+          echo "is_auction_day = \`${{ steps.lookup.outputs.is_auction_day }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.lookup.outputs.auction_summary }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+  pipeline:
+    needs: check
+    if: ${{ needs.check.outputs.is_auction_day == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        # Both refresh and notebook deps - merged so we only do one pip run.
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-notebook.txt
+
+      - name: Refresh BGK auction-result PDFs (incremental)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
+        run: python scripts/refresh_bgk_pdfs.py
+
+      - name: Refresh spread materialised views
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -fsS -X POST "${SUPABASE_URL%/}/rest/v1/rpc/bgk_refresh_spreads" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Content-Type: application/json" -d '{}'
+
+      - name: Execute notebook -> HTML
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mkdir -p public
+          jupyter nbconvert --execute --to html --no-input \
+            --ExecutePreprocessor.timeout=600 \
+            --TagRemovePreprocessor.enabled=True \
+            --TagRemovePreprocessor.remove_all_outputs_tags=hide-output \
+            --output-dir=public --output=index.html \
+            notebooks/bgk_dashboard.ipynb
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

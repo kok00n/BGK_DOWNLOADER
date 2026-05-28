@@ -1,18 +1,14 @@
 name: Render BGK dashboard to GitHub Pages
 
-# Triggers off the two BGK refresh workflows so the rendered dashboard
-# always reflects the latest XLSX/PDF state + freshly-refreshed spread MVs
-# (both refresh workflows call bgk_refresh_spreads() before they exit).
+# Manual-trigger render.
 #
-# Also exposes workflow_dispatch for manual re-render after schema changes
-# or notebook edits.
+# The auto-trigger off refresh_bgk_xlsx / refresh_bgk_pdfs was removed:
+# auction_day_pipeline.yml now owns the auction-day render path (so LLM
+# tokens are only spent on actual auction days). This workflow is
+# retained for ad-hoc re-renders (e.g. after notebook edits or after the
+# user changes prompt logic).
 
 on:
-  workflow_run:
-    workflows:
-      - refresh_bgk_xlsx
-      - refresh_bgk_pdfs
-    types: [completed]
   workflow_dispatch: {}
 
 permissions:

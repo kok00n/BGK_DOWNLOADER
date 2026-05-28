@@ -1,14 +1,13 @@
 name: refresh_bgk_pdfs
 
 # BGK auction-results PDF refresh.
-# New PDFs land on the komunikaty page ~2x/month. We poll twice a week
-# so a fresh PDF lands in DB within ~3 days. Uses ScrapingBee for CF bypass.
+#
+# Cron was removed - PDF refresh is now driven by auction_day_pipeline.yml
+# which runs daily, checks bgk_auction_calendar, and only fires the full
+# refresh+render pipeline on actual auction days (saves LLM tokens).
+# This workflow is retained for manual re-runs from the Actions tab.
 
 on:
-  schedule:
-    # Wed + Sat 17:30 UTC (= 18/19 Europe/Warsaw depending on DST).
-    # Staggered vs refresh_bgk_xlsx (Tue+Fri) so we never run both at once.
-    - cron: "30 17 * * 3,6"
   workflow_dispatch:
 
 permissions:
