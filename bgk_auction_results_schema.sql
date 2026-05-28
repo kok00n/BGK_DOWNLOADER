@@ -9,9 +9,12 @@
 -- Naming convention: bgk_* prefix (we share the Supabase project with
 -- CETO_DOWNLOADER's bondspot_* tables and the BGK XLSX table bgk_auctions).
 --
--- Scope: BGK_DOWNLOADER focuses on FPC PLN series only; this table will
--- store FPC PLN rows. The parser filters on series LIKE 'FPC%' upstream
--- (USD/JPY/FWA series live in their own series codes and are skipped).
+-- Scope: every series that appears on the komunikaty page. The page is
+-- empirically all-PLN (column headers literally read "Popyt (mln PLN)";
+-- BGK EUR/USD/JPY tranches are private placements that never appear
+-- here). As of 2026-05 this covers two program prefixes:
+--   FPC  - Fundusz Przeciwdziałania COVID-19 (dominant)
+--   FWA  - Fundusz Wsparcia Sił Zbrojnych (one 2022 auction)
 --
 -- All percent fields stored as percent (5.044, 101.72) to match
 -- bgk_auctions.yield_pct/price_pct convention.

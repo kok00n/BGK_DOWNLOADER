@@ -5,13 +5,17 @@ doesn't Cloudflare-challenge Polish IPs). Uses curl subprocess for HTTP
 to side-step the Windows local CRL-fetch failure that breaks Python's
 TLS chain validation for bgk.pl certs.
 
-Filter: keeps only series starting with 'FPC' (the FPC PLN scope).
+Scope: every series that appears on the komunikaty page. The page is
+empirically all-PLN (column headers literally read "(mln PLN)"; BGK
+EUR/USD/JPY tranches are private placements that never appear here),
+so no currency filter is needed. As of 2026-05 this covers two
+program prefixes: FPC (~99% of rows) and FWA (one 2022 auction).
 
 Usage:
     python scripts/backfill_bgk_pdfs.py
     python scripts/backfill_bgk_pdfs.py --since 2024-01-01
     python scripts/backfill_bgk_pdfs.py --dry-run --limit 3
-    python scripts/backfill_bgk_pdfs.py --series-prefix FPC,FWA  # custom filter
+    python scripts/backfill_bgk_pdfs.py --series-prefix FPC  # opt-in narrowing
 
 Requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in env (or a .env file
 loaded by the user's shell). No SCRAPINGBEE_API_KEY needed here.
@@ -36,6 +40,9 @@ from lib.supabase import upsert  # noqa: E402
 
 
 def _series_matches(series: str, prefixes: tuple[str, ...]) -> bool:
+    """Empty prefix tuple = accept all (the default - komunikaty is all-PLN)."""
+    if not prefixes:
+        return True
     return any(series.startswith(p) for p in prefixes)
 
 
@@ -46,18 +53,21 @@ def main() -> None:
                     help="parse and print but don't upsert")
     ap.add_argument("--limit", type=int,
                     help="cap number of PDFs (handy for smoke-testing)")
-    ap.add_argument("--series-prefix", default="FPC",
-                    help="comma-separated series prefixes to keep (default: FPC)")
+    ap.add_argument(
+        "--series-prefix", default="",
+        help="optional comma-separated series prefixes to keep "
+             "(default: empty = accept all series, since komunikaty page is all-PLN)",
+    )
     args = ap.parse_args()
 
     since_date = datetime.fromisoformat(args.since).date() if args.since else None
     prefixes = tuple(p.strip() for p in args.series_prefix.split(",") if p.strip())
 
-    print(f"[1/4] Fetching komunikaty page via curl...", flush=True)
+    print("[1/4] Fetching komunikaty page via curl...", flush=True)
     html = curl_get(KOMUNIKATY_PAGE).decode("utf-8")
     print(f"  -> {len(html) / 1024:.0f} KB", flush=True)
 
-    print(f"[2/4] Parsing listing...", flush=True)
+    print("[2/4] Parsing listing...", flush=True)
     entries = parse_komunikaty_listing(html)
     if since_date:
         before = len(entries)

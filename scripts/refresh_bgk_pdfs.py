@@ -76,8 +76,9 @@ def main() -> None:
         resp = scrapingbee_get(url, render_js=False)
         rows = parse_pdf(BytesIO(resp.content), url,
                          auction_date=e["auction_date"])
-        rows = [r for r in rows if r["series"].startswith("FPC")]
-        print(f"     -> {len(rows)} FPC series", flush=True)
+        # No series filter - komunikaty page is empirically all-PLN, so we
+        # take every series the PDF reports. As of 2026-05 that's FPC + FWA.
+        print(f"     -> {len(rows)} series", flush=True)
         all_rows.extend(rows)
 
     print(f"[4/4] Upserting {len(all_rows)} rows to bgk_auction_results...",
