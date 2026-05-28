@@ -54,6 +54,28 @@ def _make_session() -> requests.Session:
     return s
 
 
+def _diagnose_response(r: requests.Response) -> str:
+    """Build a multi-line diagnostic string for non-200 responses.
+
+    BGK's WAF could be blocking via Cloudflare, Akamai, Imperva, custom
+    geo filter, or rate limit - the response headers + body snippet
+    usually reveal which. Captures enough to choose the right workaround
+    without re-running the failing job.
+    """
+    interesting_headers = [
+        "server", "content-type", "content-length",
+        "cf-ray", "cf-mitigated", "x-amz-cf-id", "x-akamai-edgescape",
+        "x-iinfo", "set-cookie", "x-blocked-by", "x-served-by",
+    ]
+    lines = [f"  HTTP {r.status_code} {r.reason}"]
+    for h in interesting_headers:
+        if h in r.headers:
+            lines.append(f"  {h}: {r.headers[h][:200]}")
+    body = r.text[:800] if r.text else "(empty body)"
+    lines.append(f"  body[:800]: {body!r}")
+    return "\n".join(lines)
+
+
 def find_xlsx_url(session: requests.Session | None = None) -> tuple[str, date]:
     """Locate the current Baza_obligacji XLSX. Returns (absolute_url, snapshot_date).
 
@@ -61,6 +83,9 @@ def find_xlsx_url(session: requests.Session | None = None) -> tuple[str, date]:
     """
     s = session or _make_session()
     r = s.get(BGK_STATS_PAGE, timeout=30)
+    if r.status_code != 200:
+        print(f"[bgk_xlsx] GET {BGK_STATS_PAGE} failed:", flush=True)
+        print(_diagnose_response(r), flush=True)
     r.raise_for_status()
     html = r.text
 
