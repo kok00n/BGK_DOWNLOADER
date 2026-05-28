@@ -136,12 +136,21 @@ $$;
 --  curve's bracket (we deliberately don't extrapolate to keep spreads
 --  honest at the long end).
 -- =====================================================================
+-- NOTE: schema-qualified call `public.polgb_curve_at(...)` and explicit
+-- `SET search_path = public` on the function. Required for CREATE
+-- MATERIALIZED VIEW to plan the inlined body - without it Supabase
+-- refused to resolve polgb_curve_at(date) during MV planning even though
+-- the function exists in public and direct calls worked. The function
+-- inliner appears to evaluate the body in a context whose effective
+-- search_path drops `public`; pinning it here is the safe fix.
 CREATE OR REPLACE FUNCTION polgb_yield_interp(p_date DATE, p_tenor_years NUMERIC)
 RETURNS NUMERIC
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = public
+AS $$
     WITH curve AS (
         SELECT tenor_years, fixing_yield
-        FROM polgb_curve_at(p_date)
+        FROM public.polgb_curve_at(p_date)
         WHERE coupon_kind IN ('S', 'O')     -- nominal yield curve only
           AND fixing_yield IS NOT NULL
     ),
@@ -185,12 +194,15 @@ $$;
 --  bonds (apple/orange), then (b) over all floaters including NZ
 --  (WIBOR/POLSTR mix); both produced wrong spreads, now fixed.
 -- =====================================================================
+-- Same search_path pinning rationale as polgb_yield_interp above.
 CREATE OR REPLACE FUNCTION polgb_floater_dm_interp(p_date DATE, p_tenor_years NUMERIC)
 RETURNS NUMERIC
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET search_path = public
+AS $$
     WITH curve AS (
         SELECT tenor_years, implied_dm_pct
-        FROM polgb_curve_at(p_date)
+        FROM public.polgb_curve_at(p_date)
         WHERE bond_type = 'WZ'              -- WIBOR floaters only (no NZ/POLSTR)
           AND implied_dm_pct IS NOT NULL
     ),
