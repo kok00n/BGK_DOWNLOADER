@@ -2,3 +2,8 @@ requests==2.32.3
 openpyxl==3.1.5
 python-dateutil==2.9.0
 beautifulsoup4==4.12.3
+# curl_cffi: HTTP client with realistic Chrome TLS fingerprint. Required to
+# bypass Cloudflare Turnstile challenge on BGK Statystyka page (plain
+# requests/urllib gets HTTP 403 with cf-mitigated: challenge from Azure IPs).
+curl_cffi==0.7.4
+

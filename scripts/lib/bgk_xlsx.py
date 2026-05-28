@@ -10,6 +10,14 @@ Index page:
 Asset URL pattern:
     /files/public/Pliki/informacje/Emisje_obligacji_BGK/Statystyka/
         Baza_obligacji_strona_internetowa_DD.MM.YYYY.xlsx
+
+Cloudflare bypass:
+    BGK fronts the site with Cloudflare and serves a Turnstile challenge
+    (HTTP 403, `cf-mitigated: challenge`, "Just a moment..." body) to
+    clients with a Python JA3 TLS fingerprint - even with a full Chrome
+    User-Agent. We use `curl_cffi`, which mimics a real Chrome TLS
+    fingerprint at the libcurl level; Cloudflare then lets the request
+    through without challenge.
 """
 
 from __future__ import annotations
@@ -18,27 +26,16 @@ import re
 from datetime import date, datetime
 from io import BytesIO
 
-import requests
+from curl_cffi import requests as cffi_requests
 
 
 BGK_BASE = "https://www.bgk.pl"
 BGK_STATS_PAGE = f"{BGK_BASE}/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/"
 
-# BGK's WAF blocks default Python / generic "compatible; ..." User-Agents
-# with 403 (confirmed from GH Actions Ubuntu runner). Use a real browser
-# UA + standard Accept-* headers; carry cookies across the index->asset
-# request in case BGK sets a challenge cookie on the first hit.
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-}
+# curl_cffi impersonation target. "chrome131" = latest at time of writing;
+# pinned so the TLS fingerprint stays stable across runs (Cloudflare keys
+# on the exact JA3, so silently bumping could re-trigger the challenge).
+_IMPERSONATE = "chrome131"
 
 # Captures both href and the DD.MM.YYYY snapshot date so callers can log it.
 _XLSX_HREF_RE = re.compile(
@@ -48,35 +45,38 @@ _XLSX_HREF_RE = re.compile(
 )
 
 
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(_BROWSER_HEADERS)
+def _make_session() -> cffi_requests.Session:
+    # impersonate= sets a realistic UA + Accept + Accept-Encoding matching
+    # the chosen Chrome build. Override Accept-Language so the request
+    # looks like a Polish user (BGK's WAF may also score on geo cues).
+    s = cffi_requests.Session(impersonate=_IMPERSONATE)
+    s.headers.update({"Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"})
     return s
 
 
-def _diagnose_response(r: requests.Response) -> str:
+def _diagnose_response(r) -> str:
     """Build a multi-line diagnostic string for non-200 responses.
 
-    BGK's WAF could be blocking via Cloudflare, Akamai, Imperva, custom
-    geo filter, or rate limit - the response headers + body snippet
-    usually reveal which. Captures enough to choose the right workaround
-    without re-running the failing job.
+    Captures enough to identify which WAF / block layer is responding
+    (Cloudflare, Akamai, Imperva, ...) without a second debug run.
     """
     interesting_headers = [
         "server", "content-type", "content-length",
         "cf-ray", "cf-mitigated", "x-amz-cf-id", "x-akamai-edgescape",
         "x-iinfo", "set-cookie", "x-blocked-by", "x-served-by",
     ]
-    lines = [f"  HTTP {r.status_code} {r.reason}"]
+    reason = getattr(r, "reason", "")
+    lines = [f"  HTTP {r.status_code} {reason}".rstrip()]
     for h in interesting_headers:
-        if h in r.headers:
-            lines.append(f"  {h}: {r.headers[h][:200]}")
+        v = r.headers.get(h)
+        if v:
+            lines.append(f"  {h}: {str(v)[:200]}")
     body = r.text[:800] if r.text else "(empty body)"
     lines.append(f"  body[:800]: {body!r}")
     return "\n".join(lines)
 
 
-def find_xlsx_url(session: requests.Session | None = None) -> tuple[str, date]:
+def find_xlsx_url(session: cffi_requests.Session | None = None) -> tuple[str, date]:
     """Locate the current Baza_obligacji XLSX. Returns (absolute_url, snapshot_date).
 
     Raises if no matching link is found - signals BGK page structure changed.
@@ -105,7 +105,7 @@ def find_xlsx_url(session: requests.Session | None = None) -> tuple[str, date]:
     return href, snapshot
 
 
-def download_xlsx(url: str, session: requests.Session | None = None) -> BytesIO:
+def download_xlsx(url: str, session: cffi_requests.Session | None = None) -> BytesIO:
     """Download the BGK XLSX. Returns BytesIO ready for openpyxl."""
     s = session or _make_session()
     # Set Referer to the Statystyka page so the asset request looks like
@@ -115,8 +115,9 @@ def download_xlsx(url: str, session: requests.Session | None = None) -> BytesIO:
     return BytesIO(r.content)
 
 
-def make_session() -> requests.Session:
-    """Public factory: build a Session preconfigured with browser headers.
+def make_session() -> cffi_requests.Session:
+    """Public factory: build a Session preconfigured with the impersonated
+    Chrome TLS fingerprint + browser headers.
 
     Callers that want index + asset to share cookies (e.g. WAF challenge
     cookie set on the first request) should create one Session and pass
