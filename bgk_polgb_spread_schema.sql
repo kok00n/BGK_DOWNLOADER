@@ -231,61 +231,56 @@ WITH bgk_with_kind AS (
         WHERE a.isin = r.isin
         LIMIT 1
     ) bk ON TRUE
+),
+-- Single-call cache for polgb_*_interp + price-implied DM. Same reason as
+-- the v_bgk_issuance_spread refactor: PostgREST times out (HTTP 500)
+-- when the view ends up invoking polgb_curve_at multiple times per row.
+enriched AS (
+    SELECT
+        b.*,
+        CASE
+            WHEN b.bgk_coupon_kind = 'zmienne'
+                 AND b.stop_price IS NOT NULL AND b.stop_price > 0
+                 AND b.maturity_date > b.auction_date
+            THEN (POWER(100.0 / b.stop_price,
+                        365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
+        END AS bgk_implied_dm_pct_calc,
+        polgb_yield_interp(b.auction_date, b.tenor_years)        AS polgb_yield_at_tenor,
+        polgb_floater_dm_interp(b.auction_date, b.tenor_years)   AS polgb_floater_dm_at_tenor
+    FROM bgk_with_kind b
 )
 SELECT
-    b.auction_date,
-    b.series,
-    b.isin,
-    b.maturity_date,
-    b.tenor_years,
-    b.bgk_coupon_kind,
-    b.bgk_margin_bp,
-    b.yield_pct                AS bgk_yield_pct,
-    b.stop_price               AS bgk_stop_price,
-    -- BGK price-implied DM (zero-coupon equivalent from stop_price).
-    -- Captures the price-discount component only - ignores coupon margin.
+    e.auction_date,
+    e.series,
+    e.isin,
+    e.maturity_date,
+    e.tenor_years,
+    e.bgk_coupon_kind,
+    e.bgk_margin_bp,
+    e.yield_pct                AS bgk_yield_pct,
+    e.stop_price               AS bgk_stop_price,
+    e.bgk_implied_dm_pct_calc  AS bgk_implied_dm_pct,
+    -- BGK TRUE DM = price-implied + margin from XLSX 'Kupon' column.
     CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.stop_price IS NOT NULL AND b.stop_price > 0
-             AND b.maturity_date > b.auction_date
-        THEN (POWER(100.0 / b.stop_price,
-                    365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
-    END AS bgk_implied_dm_pct,
-    -- BGK TRUE DM = price-implied component + coupon margin from term sheet
-    -- (we ingest the margin from XLSX 'Kupon' column, e.g. 'WIBOR6M + 0,50%'
-    -- parses to margin_bp = 50, giving +0.50% on top of price-implied).
-    CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.stop_price IS NOT NULL AND b.stop_price > 0
-             AND b.maturity_date > b.auction_date
-             AND b.bgk_margin_bp IS NOT NULL
-        THEN (POWER(100.0 / b.stop_price,
-                    365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
-             + (b.bgk_margin_bp / 100.0)
+        WHEN e.bgk_coupon_kind = 'zmienne'
+             AND e.bgk_implied_dm_pct_calc IS NOT NULL
+             AND e.bgk_margin_bp IS NOT NULL
+        THEN e.bgk_implied_dm_pct_calc + (e.bgk_margin_bp / 100.0)
     END AS bgk_true_dm_pct,
-    -- POLGB curve points at the BGK tenor.
-    -- NOTE: polgb_floater_dm_interp currently returns price-implied DM only
-    -- (no POLGB WZ coupon margin yet - those are typically 5-20 bp, smaller
-    -- than BGK FPC0631's 50 bp, so a smaller residual bias). Future work:
-    -- ingest POLGB WZ margins from MF data layer the same way we do for BGK.
-    polgb_yield_interp(b.auction_date, b.tenor_years)        AS polgb_yield_at_tenor,
-    polgb_floater_dm_interp(b.auction_date, b.tenor_years)   AS polgb_floater_dm_at_tenor,
-    -- Spread in basis points.
-    -- Floater BGK: bgk_true_DM (margin + price) vs POLGB WZ implied DM.
-    -- Fixed-coupon BGK: yield-space spread vs POLGB nominal curve.
+    e.polgb_yield_at_tenor,
+    e.polgb_floater_dm_at_tenor,
     CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.bgk_margin_bp IS NOT NULL THEN
-            (
-                ((POWER(100.0 / b.stop_price,
-                        365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
-                 + (b.bgk_margin_bp / 100.0))
-                - polgb_floater_dm_interp(b.auction_date, b.tenor_years)
-            ) * 100
-        WHEN b.yield_pct IS NOT NULL THEN
-            (b.yield_pct - polgb_yield_interp(b.auction_date, b.tenor_years)) * 100
+        WHEN e.bgk_coupon_kind = 'zmienne'
+             AND e.bgk_implied_dm_pct_calc IS NOT NULL
+             AND e.bgk_margin_bp IS NOT NULL
+             AND e.polgb_floater_dm_at_tenor IS NOT NULL
+        THEN ((e.bgk_implied_dm_pct_calc + e.bgk_margin_bp / 100.0)
+              - e.polgb_floater_dm_at_tenor) * 100
+        WHEN e.yield_pct IS NOT NULL
+             AND e.polgb_yield_at_tenor IS NOT NULL
+        THEN (e.yield_pct - e.polgb_yield_at_tenor) * 100
     END AS spread_bp
-FROM bgk_with_kind b;
+FROM enriched e;
 
 COMMENT ON VIEW v_bgk_auction_spread IS
     'BGK FPC PLN per-auction spread vs POLGB curve in basis points. '
@@ -323,44 +318,47 @@ WITH base AS (
     FROM bgk_auctions a
     WHERE a.currency = 'PLN'                        -- POLGB curve is PLN-only
       AND a.maturity_date > a.issue_date
+),
+-- Compute price-implied DM + POLGB curve points ONCE per row in a CTE,
+-- then reference the cached columns in the spread CASE below. Critical
+-- for performance: otherwise Postgres re-invokes polgb_curve_at multiple
+-- times per row and the view times out on PostgREST (HTTP 500). Same
+-- consideration drove the refactor of v_bgk_auction_spread below.
+enriched AS (
+    SELECT
+        b.*,
+        CASE
+            WHEN b.bgk_coupon_kind = 'zmienne'
+                 AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0
+            THEN (POWER(100.0 / b.bgk_price_pct,
+                        365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
+        END AS bgk_implied_dm_pct,
+        polgb_yield_interp(b.issue_date, b.tenor_years)        AS polgb_yield_at_tenor,
+        polgb_floater_dm_interp(b.issue_date, b.tenor_years)   AS polgb_floater_dm_at_tenor
+    FROM base b
 )
 SELECT
-    b.*,
-    -- Floater price-implied DM
+    e.*,
+    -- Floater true DM = price-implied + margin (NULL if any input missing)
     CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0
-        THEN (POWER(100.0 / b.bgk_price_pct,
-                    365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
-    END AS bgk_implied_dm_pct,
-    -- Floater true DM = price-implied + margin from XLSX 'Kupon' string
-    CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0
-             AND b.bgk_margin_bp IS NOT NULL
-        THEN (POWER(100.0 / b.bgk_price_pct,
-                    365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
-             + (b.bgk_margin_bp / 100.0)
+        WHEN e.bgk_coupon_kind = 'zmienne'
+             AND e.bgk_implied_dm_pct IS NOT NULL
+             AND e.bgk_margin_bp IS NOT NULL
+        THEN e.bgk_implied_dm_pct + (e.bgk_margin_bp / 100.0)
     END AS bgk_true_dm_pct,
-    polgb_yield_interp(b.issue_date, b.tenor_years)        AS polgb_yield_at_tenor,
-    polgb_floater_dm_interp(b.issue_date, b.tenor_years)   AS polgb_floater_dm_at_tenor,
-    -- Spread:
-    -- Floater w/ known margin: bgk_true_DM - POLGB WZ implied DM, in bp.
-    -- Fixed-coupon: bgk_yield_pct - POLGB nominal interp, in bp.
+    -- Spread in basis points, choosing yield- or DM-space per bond kind.
     CASE
-        WHEN b.bgk_coupon_kind = 'zmienne'
-             AND b.bgk_margin_bp IS NOT NULL
-             AND b.bgk_price_pct IS NOT NULL AND b.bgk_price_pct > 0 THEN
-            (
-                ((POWER(100.0 / b.bgk_price_pct,
-                        365.25 / (b.maturity_date - b.issue_date)) - 1.0) * 100.0
-                 + (b.bgk_margin_bp / 100.0))
-                - polgb_floater_dm_interp(b.issue_date, b.tenor_years)
-            ) * 100
-        WHEN b.bgk_yield_pct IS NOT NULL THEN
-            (b.bgk_yield_pct - polgb_yield_interp(b.issue_date, b.tenor_years)) * 100
+        WHEN e.bgk_coupon_kind = 'zmienne'
+             AND e.bgk_implied_dm_pct IS NOT NULL
+             AND e.bgk_margin_bp IS NOT NULL
+             AND e.polgb_floater_dm_at_tenor IS NOT NULL
+        THEN ((e.bgk_implied_dm_pct + e.bgk_margin_bp / 100.0)
+              - e.polgb_floater_dm_at_tenor) * 100
+        WHEN e.bgk_yield_pct IS NOT NULL
+             AND e.polgb_yield_at_tenor IS NOT NULL
+        THEN (e.bgk_yield_pct - e.polgb_yield_at_tenor) * 100
     END AS spread_bp
-FROM base b;
+FROM enriched e;
 
 COMMENT ON VIEW v_bgk_issuance_spread IS
     'BGK per-issuance-event spread vs POLGB curve (bp), all PLN programs. '
