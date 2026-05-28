@@ -171,10 +171,18 @@ def parse_bgk(xlsx_bytes: BytesIO, source_url: str) -> list[dict]:
         if all(c is None or c == "" for c in row):
             continue
 
-        isin = _to_str(row[col["isin"]])
+        isin_raw = _to_str(row[col["isin"]])
         issue_date = _to_date(row[col["issue_date"]])
-        if not isin or not issue_date:
+        if not isin_raw or not issue_date:
             continue  # malformed row - skip silently
+        # BGK lists dual-issued Eurobonds with both ISINs in one cell, e.g.
+        # "XS2625207571 / US06237MAA18" (Euroclear + DTCC) or
+        # "JP90B006AED8 / JP90B006AEE6" (JASDEC + BDJ). The bond is the same
+        # instrument; we keep the first ISIN as canonical (it's the
+        # international Euroclear/JASDEC code) so the column stays
+        # VARCHAR(12) and joinable. Affected rows are USD/JPY denominated
+        # so they won't feed PLN POLGB curve interp regardless.
+        isin = isin_raw.split("/", 1)[0].strip() if "/" in isin_raw else isin_raw
 
         out.append({
             "issue_date":        issue_date.isoformat(),
