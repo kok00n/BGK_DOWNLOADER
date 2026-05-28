@@ -1,0 +1,46 @@
+# --- Sekrety i konfiguracja srodowiskowa ---
+.env
+.env.*
+*.env
+secrets/
+credentials.json
+*.key
+*.pem
+*service_role*
+*.local.json
+settings.local.json
+
+# --- Tymczasowe pliki testowe / sample (uzywane do iteracji parsera) ---
+_sample_*.html
+_sample_*.xlsx
+_sample_*.pdf
+_sample_*.json
+_test_*.py
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- IDE / edytory ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- OS junk ---
+Thumbs.db
+desktop.ini
+.DS_Store
+$RECYCLE.BIN/
+
+# --- Claude Code ---
+.claude/
+
+# --- OneDrive metadata ---
+.tmp.drivedownload/
