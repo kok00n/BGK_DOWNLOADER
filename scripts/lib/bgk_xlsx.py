@@ -23,7 +23,22 @@ import requests
 
 BGK_BASE = "https://www.bgk.pl"
 BGK_STATS_PAGE = f"{BGK_BASE}/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/"
-USER_AGENT = "Mozilla/5.0 (compatible; bgk-dashboard/1.0)"
+
+# BGK's WAF blocks default Python / generic "compatible; ..." User-Agents
+# with 403 (confirmed from GH Actions Ubuntu runner). Use a real browser
+# UA + standard Accept-* headers; carry cookies across the index->asset
+# request in case BGK sets a challenge cookie on the first hit.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # Captures both href and the DD.MM.YYYY snapshot date so callers can log it.
 _XLSX_HREF_RE = re.compile(
@@ -33,12 +48,19 @@ _XLSX_HREF_RE = re.compile(
 )
 
 
-def find_xlsx_url() -> tuple[str, date]:
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_BROWSER_HEADERS)
+    return s
+
+
+def find_xlsx_url(session: requests.Session | None = None) -> tuple[str, date]:
     """Locate the current Baza_obligacji XLSX. Returns (absolute_url, snapshot_date).
 
     Raises if no matching link is found - signals BGK page structure changed.
     """
-    r = requests.get(BGK_STATS_PAGE, headers={"User-Agent": USER_AGENT}, timeout=30)
+    s = session or _make_session()
+    r = s.get(BGK_STATS_PAGE, timeout=30)
     r.raise_for_status()
     html = r.text
 
@@ -58,8 +80,21 @@ def find_xlsx_url() -> tuple[str, date]:
     return href, snapshot
 
 
-def download_xlsx(url: str) -> BytesIO:
+def download_xlsx(url: str, session: requests.Session | None = None) -> BytesIO:
     """Download the BGK XLSX. Returns BytesIO ready for openpyxl."""
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=120)
+    s = session or _make_session()
+    # Set Referer to the Statystyka page so the asset request looks like
+    # a click-from-index, which some WAFs require.
+    r = s.get(url, headers={"Referer": BGK_STATS_PAGE}, timeout=120)
     r.raise_for_status()
     return BytesIO(r.content)
+
+
+def make_session() -> requests.Session:
+    """Public factory: build a Session preconfigured with browser headers.
+
+    Callers that want index + asset to share cookies (e.g. WAF challenge
+    cookie set on the first request) should create one Session and pass
+    it to both find_xlsx_url() and download_xlsx().
+    """
+    return _make_session()
