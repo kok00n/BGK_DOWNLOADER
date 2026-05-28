@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS bgk_auctions (
     program           TEXT,                              -- KFD, FPC, ...
     years_to_maturity SMALLINT,                          -- original tenor at issuance
     coupon_kind       TEXT,                              -- 'stałe' / 'zmienne'
-    coupon_pct        NUMERIC(12,6),                     -- e.g. 5.75
+    coupon_pct        NUMERIC(12,6),                     -- fixed bonds only, e.g. 5.75
+    coupon_ref_rate   TEXT,                              -- floaters: 'WIBOR6M' / 'POLSTR' / ...
+    coupon_margin_bp  NUMERIC(8,2),                      -- floaters: bp over ref rate, e.g. 50.00
     currency          CHAR(3)      NOT NULL DEFAULT 'PLN',
     issue_amount      NUMERIC(20,2),                     -- nominal, in `currency`
     price_pct         NUMERIC(14,6),                     -- e.g. 98.901
@@ -62,6 +64,10 @@ CREATE TABLE IF NOT EXISTS bgk_auctions (
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     PRIMARY KEY (issue_date, isin)
 );
+
+-- Idempotent migration for existing installs (skipped on fresh CREATE).
+ALTER TABLE IF EXISTS bgk_auctions ADD COLUMN IF NOT EXISTS coupon_ref_rate  TEXT;
+ALTER TABLE IF EXISTS bgk_auctions ADD COLUMN IF NOT EXISTS coupon_margin_bp NUMERIC(8,2);
 
 CREATE INDEX IF NOT EXISTS idx_bgk_auctions_isin       ON bgk_auctions(isin, issue_date DESC);
 CREATE INDEX IF NOT EXISTS idx_bgk_auctions_maturity   ON bgk_auctions(maturity_date);

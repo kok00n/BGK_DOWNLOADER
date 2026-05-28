@@ -219,14 +219,18 @@ CREATE OR REPLACE VIEW v_bgk_auction_spread AS
 WITH bgk_with_kind AS (
     SELECT
         r.*,
-        -- coupon_kind from XLSX (bgk_auctions). Same bond -> same kind
-        -- regardless of which issuance row we sample, so any row works.
-        (SELECT a.coupon_kind FROM bgk_auctions a WHERE a.isin = r.isin LIMIT 1)
-            AS bgk_coupon_kind,
-        -- Tenor at auction date.
-        (r.maturity_date - r.auction_date)::NUMERIC / 365.25
-            AS tenor_years
+        -- coupon_kind + coupon_margin_bp from XLSX (bgk_auctions). Bond-level
+        -- properties, same across all issuance events for a given ISIN.
+        bk.coupon_kind        AS bgk_coupon_kind,
+        bk.coupon_margin_bp   AS bgk_margin_bp,
+        (r.maturity_date - r.auction_date)::NUMERIC / 365.25 AS tenor_years
     FROM bgk_auction_results r
+    LEFT JOIN LATERAL (
+        SELECT a.coupon_kind, a.coupon_margin_bp
+        FROM bgk_auctions a
+        WHERE a.isin = r.isin
+        LIMIT 1
+    ) bk ON TRUE
 )
 SELECT
     b.auction_date,
@@ -235,9 +239,11 @@ SELECT
     b.maturity_date,
     b.tenor_years,
     b.bgk_coupon_kind,
+    b.bgk_margin_bp,
     b.yield_pct                AS bgk_yield_pct,
     b.stop_price               AS bgk_stop_price,
-    -- BGK implied DM (only meaningful for floaters)
+    -- BGK price-implied DM (zero-coupon equivalent from stop_price).
+    -- Captures the price-discount component only - ignores coupon margin.
     CASE
         WHEN b.bgk_coupon_kind = 'zmienne'
              AND b.stop_price IS NOT NULL AND b.stop_price > 0
@@ -245,21 +251,35 @@ SELECT
         THEN (POWER(100.0 / b.stop_price,
                     365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
     END AS bgk_implied_dm_pct,
-    -- POLGB curve points at the BGK tenor: nominal yield for fixed-coupon
-    -- BGK, floater DM for floater BGK. Both interpolated linearly.
+    -- BGK TRUE DM = price-implied component + coupon margin from term sheet
+    -- (we ingest the margin from XLSX 'Kupon' column, e.g. 'WIBOR6M + 0,50%'
+    -- parses to margin_bp = 50, giving +0.50% on top of price-implied).
+    CASE
+        WHEN b.bgk_coupon_kind = 'zmienne'
+             AND b.stop_price IS NOT NULL AND b.stop_price > 0
+             AND b.maturity_date > b.auction_date
+             AND b.bgk_margin_bp IS NOT NULL
+        THEN (POWER(100.0 / b.stop_price,
+                    365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
+             + (b.bgk_margin_bp / 100.0)
+    END AS bgk_true_dm_pct,
+    -- POLGB curve points at the BGK tenor.
+    -- NOTE: polgb_floater_dm_interp currently returns price-implied DM only
+    -- (no POLGB WZ coupon margin yet - those are typically 5-20 bp, smaller
+    -- than BGK FPC0631's 50 bp, so a smaller residual bias). Future work:
+    -- ingest POLGB WZ margins from MF data layer the same way we do for BGK.
     polgb_yield_interp(b.auction_date, b.tenor_years)        AS polgb_yield_at_tenor,
     polgb_floater_dm_interp(b.auction_date, b.tenor_years)   AS polgb_floater_dm_at_tenor,
-    -- Spread in basis points. Floater BGK -> DM-space vs POLGB WZ curve.
-    -- Fixed-coupon BGK -> yield-space vs POLGB nominal curve.
+    -- Spread in basis points.
+    -- Floater BGK: bgk_true_DM (margin + price) vs POLGB WZ implied DM.
+    -- Fixed-coupon BGK: yield-space spread vs POLGB nominal curve.
     CASE
-        WHEN b.bgk_coupon_kind = 'zmienne' THEN
+        WHEN b.bgk_coupon_kind = 'zmienne'
+             AND b.bgk_margin_bp IS NOT NULL THEN
             (
-                CASE
-                    WHEN b.stop_price IS NOT NULL AND b.stop_price > 0
-                         AND b.maturity_date > b.auction_date
-                    THEN (POWER(100.0 / b.stop_price,
-                                365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
-                END
+                ((POWER(100.0 / b.stop_price,
+                        365.25 / (b.maturity_date - b.auction_date)) - 1.0) * 100.0
+                 + (b.bgk_margin_bp / 100.0))
                 - polgb_floater_dm_interp(b.auction_date, b.tenor_years)
             ) * 100
         WHEN b.yield_pct IS NOT NULL THEN

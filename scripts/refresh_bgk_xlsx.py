@@ -22,6 +22,7 @@ Idempotent via PRIMARY KEY (issue_date, isin); reruns overwrite.
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import date, datetime
 from io import BytesIO
@@ -120,6 +121,42 @@ def _to_str(value) -> str | None:
     return s or None
 
 
+# Floater coupon column carries strings like:
+#   'WIBOR6M + 0,50%'  (margin in Polish decimal notation)
+#   'WIBOR6M'          (pure benchmark, no margin)
+#   'POLSTR + 0,15%'
+#   'WIBOR3M + 1,25%'
+# Captures (ref_rate, sign, margin_decimal). Fixed bonds put a numeric
+# decimal here (0.0575) - this regex won't match, and we treat it as
+# coupon_pct instead.
+_FLOATER_COUPON_RE = re.compile(
+    r"^(WIBOR\d+M|POLSTR|EURIBOR\d+M|SOFR)"
+    r"\s*(?:([+\-])\s*([\d,\.]+)\s*%?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_floater_coupon(value) -> tuple[str | None, float | None]:
+    """Parse 'WIBOR6M [+/- X,XX%]' into (ref_rate, margin_bp).
+
+    Returns (None, None) for fixed-coupon (numeric) cells or unparseable
+    strings. Margin '0,50' -> 50.0 bp. Missing sign part -> 0 bp.
+    """
+    if value is None or not isinstance(value, str):
+        return None, None
+    m = _FLOATER_COUPON_RE.match(value.strip())
+    if not m:
+        return None, None
+    ref_rate = m.group(1).upper()
+    sign_chr = m.group(2) or "+"
+    margin_str = m.group(3)
+    if margin_str is None:
+        return ref_rate, 0.0
+    margin_pct = float(margin_str.replace(",", "."))
+    margin_bp = margin_pct * 100.0 * (1.0 if sign_chr == "+" else -1.0)
+    return ref_rate, margin_bp
+
+
 def _build_header_index(headers: list) -> dict[str, int]:
     """Map each logical field to the column index that matched a candidate."""
     idx: dict[str, int] = {}
@@ -194,7 +231,12 @@ def parse_bgk(xlsx_bytes: BytesIO, source_url: str) -> list[dict]:
             "years_to_maturity": int(_to_float(row[col["years_to_maturity"]]))
                                  if _to_float(row[col["years_to_maturity"]]) is not None else None,
             "coupon_kind":       _normalize_coupon_kind(row[col["coupon_kind"]]),
+            # For fixed bonds the "Kupon" cell is a decimal (0.0575); for
+            # floaters it is a string ('WIBOR6M + 0,50%'). Try both
+            # interpretations - whichever doesn't apply yields NULL.
             "coupon_pct":        _decimal_to_pct(row[col["coupon_pct"]]),
+            "coupon_ref_rate":   _parse_floater_coupon(row[col["coupon_pct"]])[0],
+            "coupon_margin_bp":  _parse_floater_coupon(row[col["coupon_pct"]])[1],
             "currency":          (_to_str(row[col["currency"]]) or "PLN")[:3],
             "issue_amount":      _to_float(row[col["issue_amount"]]),
             "price_pct":         _decimal_to_pct(row[col["price_pct"]]),
