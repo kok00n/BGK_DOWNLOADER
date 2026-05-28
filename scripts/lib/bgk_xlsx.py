@@ -32,10 +32,13 @@ from curl_cffi import requests as cffi_requests
 BGK_BASE = "https://www.bgk.pl"
 BGK_STATS_PAGE = f"{BGK_BASE}/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/"
 
-# curl_cffi impersonation target. "chrome131" = latest at time of writing;
-# pinned so the TLS fingerprint stays stable across runs (Cloudflare keys
-# on the exact JA3, so silently bumping could re-trigger the challenge).
-_IMPERSONATE = "chrome131"
+# curl_cffi impersonation target. "chrome124" = newest Chrome JA3 shipped
+# in curl_cffi 0.7.x (the 0.7.4 we pin). If we bump curl_cffi to 0.8+, we
+# can move to chrome131/133 - which Cloudflare currently treats as "more
+# trustworthy" than older Chromes since it's still the dominant version.
+# Pinned so the TLS fingerprint stays stable across runs (Cloudflare keys
+# on the exact JA3, silent bumps could re-trigger the challenge).
+_IMPERSONATE = "chrome124"
 
 # Captures both href and the DD.MM.YYYY snapshot date so callers can log it.
 _XLSX_HREF_RE = re.compile(
