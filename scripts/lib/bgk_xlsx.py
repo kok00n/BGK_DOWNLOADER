@@ -1,8 +1,13 @@
 """Shared helpers for downloading BGK's "Baza obligacji" XLSX.
 
-The XLSX URL embeds a DD.MM.YYYY date in the filename (updated weekly to
-biweekly), so we scrape the Statystyka index page on each run to find
-the current link.
+BGK fronts the Statystyka page with Cloudflare and serves a Turnstile
+challenge to non-browser clients - confirmed even with curl_cffi's
+Chrome JA3 impersonation. We use headless Chromium via Playwright: the
+challenge resolves automatically because a real browser executes the
+challenge JS, sets a cf_clearance cookie, and that cookie is reused
+for the subsequent XLSX download via context.request.
+
+Single browser launch covers both: index-page render + XLSX fetch.
 
 Index page:
     https://www.bgk.pl/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/
@@ -10,14 +15,6 @@ Index page:
 Asset URL pattern:
     /files/public/Pliki/informacje/Emisje_obligacji_BGK/Statystyka/
         Baza_obligacji_strona_internetowa_DD.MM.YYYY.xlsx
-
-Cloudflare bypass:
-    BGK fronts the site with Cloudflare and serves a Turnstile challenge
-    (HTTP 403, `cf-mitigated: challenge`, "Just a moment..." body) to
-    clients with a Python JA3 TLS fingerprint - even with a full Chrome
-    User-Agent. We use `curl_cffi`, which mimics a real Chrome TLS
-    fingerprint at the libcurl level; Cloudflare then lets the request
-    through without challenge.
 """
 
 from __future__ import annotations
@@ -26,19 +23,16 @@ import re
 from datetime import date, datetime
 from io import BytesIO
 
-from curl_cffi import requests as cffi_requests
+from playwright.sync_api import sync_playwright
 
 
 BGK_BASE = "https://www.bgk.pl"
 BGK_STATS_PAGE = f"{BGK_BASE}/dla-klienta/relacje-inwestorskie/emisje-obligacji-bgk/statystyka/"
 
-# curl_cffi impersonation target. "chrome124" = newest Chrome JA3 shipped
-# in curl_cffi 0.7.x (the 0.7.4 we pin). If we bump curl_cffi to 0.8+, we
-# can move to chrome131/133 - which Cloudflare currently treats as "more
-# trustworthy" than older Chromes since it's still the dominant version.
-# Pinned so the TLS fingerprint stays stable across runs (Cloudflare keys
-# on the exact JA3, silent bumps could re-trigger the challenge).
-_IMPERSONATE = "chrome124"
+# How long to wait for Cloudflare's Turnstile challenge to resolve. The
+# challenge JS typically clears in 5-15s on a real browser; 60s is a
+# safety margin for slow runs.
+_CHALLENGE_TIMEOUT_MS = 60_000
 
 # Captures both href and the DD.MM.YYYY snapshot date so callers can log it.
 _XLSX_HREF_RE = re.compile(
@@ -48,57 +42,18 @@ _XLSX_HREF_RE = re.compile(
 )
 
 
-def _make_session() -> cffi_requests.Session:
-    # impersonate= sets a realistic UA + Accept + Accept-Encoding matching
-    # the chosen Chrome build. Override Accept-Language so the request
-    # looks like a Polish user (BGK's WAF may also score on geo cues).
-    s = cffi_requests.Session(impersonate=_IMPERSONATE)
-    s.headers.update({"Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"})
-    return s
+def _parse_xlsx_link(html: str) -> tuple[str, date]:
+    """Find the newest Baza_obligacji XLSX link in the rendered HTML.
 
-
-def _diagnose_response(r) -> str:
-    """Build a multi-line diagnostic string for non-200 responses.
-
-    Captures enough to identify which WAF / block layer is responding
-    (Cloudflare, Akamai, Imperva, ...) without a second debug run.
+    Returns (absolute_url, snapshot_date_from_filename). Raises if no
+    match - signals BGK page structure changed or challenge didn't clear.
     """
-    interesting_headers = [
-        "server", "content-type", "content-length",
-        "cf-ray", "cf-mitigated", "x-amz-cf-id", "x-akamai-edgescape",
-        "x-iinfo", "set-cookie", "x-blocked-by", "x-served-by",
-    ]
-    reason = getattr(r, "reason", "")
-    lines = [f"  HTTP {r.status_code} {reason}".rstrip()]
-    for h in interesting_headers:
-        v = r.headers.get(h)
-        if v:
-            lines.append(f"  {h}: {str(v)[:200]}")
-    body = r.text[:800] if r.text else "(empty body)"
-    lines.append(f"  body[:800]: {body!r}")
-    return "\n".join(lines)
-
-
-def find_xlsx_url(session: cffi_requests.Session | None = None) -> tuple[str, date]:
-    """Locate the current Baza_obligacji XLSX. Returns (absolute_url, snapshot_date).
-
-    Raises if no matching link is found - signals BGK page structure changed.
-    """
-    s = session or _make_session()
-    r = s.get(BGK_STATS_PAGE, timeout=30)
-    if r.status_code != 200:
-        print(f"[bgk_xlsx] GET {BGK_STATS_PAGE} failed:", flush=True)
-        print(_diagnose_response(r), flush=True)
-    r.raise_for_status()
-    html = r.text
-
-    # If multiple snapshots are linked (historical archive), pick the newest by
-    # the date embedded in the filename - not by source order.
     matches = list(_XLSX_HREF_RE.finditer(html))
     if not matches:
         raise RuntimeError(
-            "Could not find Baza_obligacji_*.xlsx link on BGK Statystyka page. "
-            f"Page structure may have changed. URL: {BGK_STATS_PAGE}"
+            "Could not find Baza_obligacji_*.xlsx link in rendered HTML. "
+            "Either the BGK page structure changed or the Cloudflare "
+            "challenge did not resolve. URL: " + BGK_STATS_PAGE
         )
     best = max(matches, key=lambda m: datetime.strptime(m.group("date"), "%d.%m.%Y"))
     href = best.group("href")
@@ -108,22 +63,71 @@ def find_xlsx_url(session: cffi_requests.Session | None = None) -> tuple[str, da
     return href, snapshot
 
 
-def download_xlsx(url: str, session: cffi_requests.Session | None = None) -> BytesIO:
-    """Download the BGK XLSX. Returns BytesIO ready for openpyxl."""
-    s = session or _make_session()
-    # Set Referer to the Statystyka page so the asset request looks like
-    # a click-from-index, which some WAFs require.
-    r = s.get(url, headers={"Referer": BGK_STATS_PAGE}, timeout=120)
-    r.raise_for_status()
-    return BytesIO(r.content)
+def fetch_bgk_xlsx() -> tuple[BytesIO, str, date]:
+    """Fetch the latest BGK Baza_obligacji XLSX through headless Chromium.
 
-
-def make_session() -> cffi_requests.Session:
-    """Public factory: build a Session preconfigured with the impersonated
-    Chrome TLS fingerprint + browser headers.
-
-    Callers that want index + asset to share cookies (e.g. WAF challenge
-    cookie set on the first request) should create one Session and pass
-    it to both find_xlsx_url() and download_xlsx().
+    Returns (xlsx_bytes, source_url, snapshot_date). One browser launch
+    covers index render + XLSX download so the cf_clearance cookie set
+    by the challenge is reused for the asset request.
     """
-    return _make_session()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                locale="pl-PL",
+                timezone_id="Europe/Warsaw",
+                # Playwright's default UA contains "HeadlessChrome" which
+                # some WAFs flag. Override with the equivalent Chrome UA.
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            page = context.new_page()
+            print(f"  -> navigating to {BGK_STATS_PAGE}", flush=True)
+            page.goto(BGK_STATS_PAGE, wait_until="domcontentloaded",
+                      timeout=_CHALLENGE_TIMEOUT_MS)
+
+            # The Cloudflare challenge serves a "Just a moment..." page,
+            # then JS-redirects to the real content. Wait until our
+            # target link appears in the DOM - that means challenge
+            # cleared AND page rendered (single condition for both).
+            print("  -> waiting for Cloudflare challenge to clear and "
+                  "Baza_obligacji link to appear...", flush=True)
+            page.wait_for_function(
+                "() => document.querySelector("
+                "'a[href*=\"Baza_obligacji_strona_internetowa\"]') !== null",
+                timeout=_CHALLENGE_TIMEOUT_MS,
+            )
+
+            html = page.content()
+            url, snapshot = _parse_xlsx_link(html)
+            print(f"  -> found XLSX: {url}", flush=True)
+            print(f"  -> snapshot date: {snapshot.isoformat()}", flush=True)
+
+            # Reuse the cleared browser context (with cf_clearance cookie)
+            # for the asset request. context.request runs through the same
+            # session, so Cloudflare sees a continued browsing session
+            # rather than a fresh request.
+            print("  -> downloading XLSX through cleared browser session...",
+                  flush=True)
+            response = context.request.get(
+                url,
+                headers={"Referer": BGK_STATS_PAGE},
+                timeout=_CHALLENGE_TIMEOUT_MS,
+            )
+            if response.status != 200:
+                raise RuntimeError(
+                    f"XLSX download failed: HTTP {response.status} "
+                    f"{response.status_text}"
+                )
+            xlsx_bytes = response.body()
+            print(f"  -> {len(xlsx_bytes) / 1024:.0f} KB downloaded",
+                  flush=True)
+            return BytesIO(xlsx_bytes), url, snapshot
+        finally:
+            browser.close()

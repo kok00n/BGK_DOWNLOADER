@@ -30,7 +30,7 @@ from pathlib import Path
 import openpyxl
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib.bgk_xlsx import download_xlsx, find_xlsx_url, make_session  # noqa: E402
+from lib.bgk_xlsx import fetch_bgk_xlsx  # noqa: E402
 from lib.supabase import upsert  # noqa: E402
 
 
@@ -227,24 +227,15 @@ def _print_summary(rows: list[dict]) -> None:
 
 
 def main() -> None:
-    # Share one Session across index + asset request so any WAF cookie
-    # set on the first hit travels with the second hit.
-    session = make_session()
+    print("[1/3] Fetching BGK XLSX via headless Chromium (Cloudflare bypass)...",
+          flush=True)
+    xlsx, url, _snapshot = fetch_bgk_xlsx()
 
-    print("[1/4] Locating BGK Baza_obligacji XLSX URL...", flush=True)
-    url, snapshot = find_xlsx_url(session=session)
-    print(f"  -> {url}", flush=True)
-    print(f"  -> snapshot date: {snapshot.isoformat()}", flush=True)
-
-    print("[2/4] Downloading XLSX...", flush=True)
-    xlsx = download_xlsx(url, session=session)
-    print(f"  -> {xlsx.getbuffer().nbytes / 1024:.0f} KB", flush=True)
-
-    print("[3/4] Parsing 'Baza obligacji' sheet...", flush=True)
+    print("[2/3] Parsing 'Baza obligacji' sheet...", flush=True)
     rows = parse_bgk(xlsx, url)
     _print_summary(rows)
 
-    print("[4/4] Upserting to bgk_auctions...", flush=True)
+    print("[3/3] Upserting to bgk_auctions...", flush=True)
     posted = upsert(
         "bgk_auctions",
         rows,
