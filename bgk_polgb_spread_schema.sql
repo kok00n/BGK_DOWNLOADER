@@ -36,9 +36,15 @@
 
 -- Drop dependent views FIRST so the subsequent function drops don't error
 -- with "cannot drop function because other objects depend on it". Both
--- views reference polgb_*_interp, so both must go before functions.
-DROP VIEW IF EXISTS v_bgk_issuance_spread;
-DROP VIEW IF EXISTS v_bgk_auction_spread;
+-- spread views reference polgb_*_interp.
+--
+-- Both DROP MATERIALIZED VIEW and DROP VIEW listed, idempotent - one of
+-- them will succeed depending on what the previous deploy created.
+DROP MATERIALIZED VIEW IF EXISTS v_bgk_issuance_spread CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS v_bgk_auction_spread  CASCADE;
+DROP VIEW              IF EXISTS v_bgk_issuance_spread CASCADE;
+DROP VIEW              IF EXISTS v_bgk_auction_spread  CASCADE;
+DROP FUNCTION IF EXISTS bgk_refresh_spreads();
 DROP FUNCTION IF EXISTS polgb_floater_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_dm_interp(DATE, NUMERIC);
 DROP FUNCTION IF EXISTS polgb_yield_interp(DATE, NUMERIC);
@@ -219,7 +225,7 @@ $$;
 --  with the bond's coupon kind (from bgk_auctions), the POLGB curve
 --  point at the same tenor, and the spread in basis points.
 -- =====================================================================
-CREATE OR REPLACE VIEW v_bgk_auction_spread AS
+CREATE MATERIALIZED VIEW v_bgk_auction_spread AS
 WITH bgk_with_kind AS (
     SELECT
         r.*,
@@ -236,12 +242,9 @@ WITH bgk_with_kind AS (
         LIMIT 1
     ) bk ON TRUE
 ),
--- Force MATERIALIZED so polgb_*_interp runs ONCE per row, not once per
--- column reference. Without MATERIALIZED the Postgres 12+ planner
--- inlines STABLE function calls into the outer SELECT, defeating the
--- cache and re-evaluating polgb_curve_at multiple times per row -
--- which causes HTTP 500 timeouts on PostgREST for select=* queries.
-enriched AS MATERIALIZED (
+-- enriched CTE runs once per row via the parent materialised view;
+-- polgb_*_interp results land in physical storage on REFRESH.
+enriched AS (
     SELECT
         b.*,
         CASE
@@ -288,11 +291,10 @@ SELECT
     END AS spread_bp
 FROM enriched e;
 
-COMMENT ON VIEW v_bgk_auction_spread IS
+COMMENT ON MATERIALIZED VIEW v_bgk_auction_spread IS
     'BGK FPC PLN per-auction spread vs POLGB curve in basis points. '
-    'Source: bgk_auction_results (PDF auctions). FPC only because other '
-    'BGK programs (KFD/FP/FWSZ/własne) place privately and have no public '
-    'auction PDFs. Use v_bgk_issuance_spread for broader program coverage.';
+    'Source: bgk_auction_results (PDF auctions). Materialised - call '
+    'bgk_refresh_spreads() to update after refresh_bgk_pdfs workflow.';
 
 -- =====================================================================
 --  VIEW: per-issuance spread vs POLGB curve, ANY PLN program.
@@ -304,8 +306,7 @@ COMMENT ON VIEW v_bgk_auction_spread IS
 --  KFD vs FPC vs FWSZ). Use v_bgk_auction_spread when you need exact
 --  auction-day numbers and B/C metrics (FPC only).
 -- =====================================================================
-DROP VIEW IF EXISTS v_bgk_issuance_spread;
-CREATE OR REPLACE VIEW v_bgk_issuance_spread AS
+CREATE MATERIALIZED VIEW v_bgk_issuance_spread AS
 WITH base AS (
     SELECT
         a.issue_date,
@@ -325,12 +326,9 @@ WITH base AS (
     WHERE a.currency = 'PLN'                        -- POLGB curve is PLN-only
       AND a.maturity_date > a.issue_date
 ),
--- Compute price-implied DM + POLGB curve points ONCE per row in a CTE,
--- then reference the cached columns in the spread CASE below. The
--- AS MATERIALIZED hint is required: without it the planner inlines
--- the STABLE polgb_*_interp calls into the outer SELECT, defeating
--- the cache and causing HTTP 500 timeouts on PostgREST select=*.
-enriched AS MATERIALIZED (
+-- enriched CTE materialises with the parent MV on REFRESH; polgb_*_interp
+-- runs once per row at refresh time, results land in physical storage.
+enriched AS (
     SELECT
         b.*,
         CASE
@@ -366,7 +364,46 @@ SELECT
     END AS spread_bp
 FROM enriched e;
 
-COMMENT ON VIEW v_bgk_issuance_spread IS
+COMMENT ON MATERIALIZED VIEW v_bgk_issuance_spread IS
     'BGK per-issuance-event spread vs POLGB curve (bp), all PLN programs. '
-    'Source: bgk_auctions XLSX. Use for cross-program time-series. '
-    'v_bgk_auction_spread is FPC-only with auction-day PDF precision.';
+    'Source: bgk_auctions XLSX. Materialised - call bgk_refresh_spreads() '
+    'after refresh_bgk_xlsx workflow runs to update.';
+
+-- =====================================================================
+--  UNIQUE INDEXes - required for REFRESH MATERIALIZED VIEW CONCURRENTLY.
+--  Match each view's natural key.
+-- =====================================================================
+CREATE UNIQUE INDEX IF NOT EXISTS uq_v_bgk_auction_spread
+    ON v_bgk_auction_spread  (auction_date, series);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_v_bgk_issuance_spread
+    ON v_bgk_issuance_spread (issue_date, isin);
+
+-- Secondary indexes that help common dashboard filters.
+CREATE INDEX IF NOT EXISTS idx_v_bgk_issuance_spread_program
+    ON v_bgk_issuance_spread (program, issue_date DESC);
+CREATE INDEX IF NOT EXISTS idx_v_bgk_issuance_spread_series
+    ON v_bgk_issuance_spread (series, issue_date DESC);
+
+-- =====================================================================
+--  FUNCTION: bgk_refresh_spreads() - one-shot refresh of both spread
+--  materialised views, callable from workflows or the SQL editor.
+--  Uses CONCURRENTLY so readers (dashboard, notebook) keep working
+--  during refresh; relies on the unique indexes above.
+-- =====================================================================
+CREATE OR REPLACE FUNCTION bgk_refresh_spreads()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY v_bgk_auction_spread;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY v_bgk_issuance_spread;
+    RETURN 'refreshed at ' || now();
+END;
+$$;
+
+-- =====================================================================
+--  Initial populate. REFRESH CONCURRENTLY requires the MV to be already
+--  populated, so we do a plain non-concurrent REFRESH on first install
+--  (will block briefly while polgb_*_interp runs 304 + 277 rows worth).
+-- =====================================================================
+REFRESH MATERIALIZED VIEW v_bgk_auction_spread;
+REFRESH MATERIALIZED VIEW v_bgk_issuance_spread;
