@@ -1,0 +1,8 @@
+# Local-only dependencies for notebooks/bgk_dashboard.ipynb
+# Install with: pip install -r requirements-notebook.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org
+jupyterlab>=4.0
+pandas>=2.0
+plotly>=5.20
+python-dotenv>=1.0
+requests>=2.32
+nbconvert>=7.0
