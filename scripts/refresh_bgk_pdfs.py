@@ -6,10 +6,16 @@ bgk.pl. Only processes PDFs newer than the latest auction_date already
 in DB - typically 0-2 new PDFs per weekly run, keeping credit burn low.
 
 For initial population, run scripts/backfill_bgk_pdfs.py locally instead.
+
+When GITHUB_OUTPUT is set (i.e. running inside a GH Actions step) we
+also write `new_auctions=N` so a downstream step can branch on it
+without parsing stdout. N is the count of NEW auction *days* found,
+not the count of series rows.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date
 from io import BytesIO
@@ -33,6 +39,20 @@ def _latest_auction_date_in_db() -> date | None:
     if not rows:
         return None
     return date.fromisoformat(str(rows[0]["auction_date"])[:10])
+
+
+def _emit_gh_output(key: str, value) -> None:
+    """Append `key=value` to $GITHUB_OUTPUT if running inside Actions.
+
+    Used by the workflow that wraps this script to branch on whether
+    any new auction PDFs landed (-> trigger render) or not (-> skip
+    so we don't burn LLM tokens on no-op days).
+    """
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{key}={value}\n")
 
 
 def main() -> None:
@@ -62,6 +82,7 @@ def main() -> None:
         f"  -> latest in DB: {latest}; {len(new_entries)} new PDF(s) to fetch",
         flush=True,
     )
+    _emit_gh_output("new_auctions", len(new_entries))
     if not new_entries:
         print("[3/4] nothing to do - DB is current", flush=True)
         print("[4/4] 0 rows posted", flush=True)
