@@ -39,3 +39,17 @@ jobs:
           # Playwright stealth all failed from Azure IPs.
           SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_xlsx.py
+
+      - name: Refresh spread materialised views
+        # v_bgk_issuance_spread + v_bgk_auction_spread re-compute polgb_*_interp
+        # for every row at refresh time; do it once here so the dashboard
+        # render that follows reads from physical tables, not function calls.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -fsS -X POST "${SUPABASE_URL%/}/rest/v1/rpc/bgk_refresh_spreads" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}'

@@ -36,3 +36,16 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_pdfs.py
+
+      - name: Refresh spread materialised views
+        # Same as in refresh_bgk_xlsx: re-populate v_bgk_*_spread MVs so the
+        # downstream dashboard render reads physical tables, not function inlines.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -fsS -X POST "${SUPABASE_URL%/}/rest/v1/rpc/bgk_refresh_spreads" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}'

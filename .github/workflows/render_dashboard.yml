@@ -1,0 +1,71 @@
+name: Render BGK dashboard to GitHub Pages
+
+# Triggers off the two BGK refresh workflows so the rendered dashboard
+# always reflects the latest XLSX/PDF state + freshly-refreshed spread MVs
+# (both refresh workflows call bgk_refresh_spreads() before they exit).
+#
+# Also exposes workflow_dispatch for manual re-render after schema changes
+# or notebook edits.
+
+on:
+  workflow_run:
+    workflows:
+      - refresh_bgk_xlsx
+      - refresh_bgk_pdfs
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid clashes when both refresh workflows finish around the same time.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  render:
+    # Skip if the triggering workflow failed (manual dispatch always runs).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install notebook dependencies
+        run: pip install -r requirements-notebook.txt
+
+      - name: Execute notebook -> HTML
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mkdir -p public
+          # --no-input ukrywa code inputs (dashboard dla biz audience -
+          # widac tylko markdown, charty, tabele, LLM commentary).
+          # TagRemovePreprocessor.remove_all_outputs_tags ukrywa outputs
+          # cell-i otagowanych 'hide-output' (dev diagnostic prints).
+          jupyter nbconvert --execute --to html --no-input \
+            --ExecutePreprocessor.timeout=600 \
+            --TagRemovePreprocessor.enabled=True \
+            --TagRemovePreprocessor.remove_all_outputs_tags=hide-output \
+            --output-dir=public --output=index.html \
+            notebooks/bgk_dashboard.ipynb
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
