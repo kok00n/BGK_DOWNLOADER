@@ -17,7 +17,22 @@ def _env(name: str) -> str:
     return val
 
 
-SUPABASE_URL = _env("SUPABASE_URL").rstrip("/")
+def _normalize_supabase_url(raw: str) -> str:
+    """Strip trailing slash and a trailing /rest/v1 if the operator pasted
+    the full PostgREST endpoint instead of the project base URL. Without
+    this, our `f"{url}/rest/v1/..."` build doubles up to `.../rest/v1/rest/v1/...`
+    and PostgREST replies 404 PGRST125 - which is a confusing error for
+    a config typo. (Confirmed bite from a 2026-05-28 deploy.)
+    """
+    u = raw.strip().rstrip("/")
+    for suffix in ("/rest/v1", "/rest"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)]
+            break
+    return u
+
+
+SUPABASE_URL = _normalize_supabase_url(_env("SUPABASE_URL"))
 SUPABASE_KEY = _env("SUPABASE_SERVICE_ROLE_KEY")
 
 _HEADERS = {
