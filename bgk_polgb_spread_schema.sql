@@ -236,10 +236,12 @@ WITH bgk_with_kind AS (
         LIMIT 1
     ) bk ON TRUE
 ),
--- Single-call cache for polgb_*_interp + price-implied DM. Same reason as
--- the v_bgk_issuance_spread refactor: PostgREST times out (HTTP 500)
--- when the view ends up invoking polgb_curve_at multiple times per row.
-enriched AS (
+-- Force MATERIALIZED so polgb_*_interp runs ONCE per row, not once per
+-- column reference. Without MATERIALIZED the Postgres 12+ planner
+-- inlines STABLE function calls into the outer SELECT, defeating the
+-- cache and re-evaluating polgb_curve_at multiple times per row -
+-- which causes HTTP 500 timeouts on PostgREST for select=* queries.
+enriched AS MATERIALIZED (
     SELECT
         b.*,
         CASE
@@ -324,11 +326,11 @@ WITH base AS (
       AND a.maturity_date > a.issue_date
 ),
 -- Compute price-implied DM + POLGB curve points ONCE per row in a CTE,
--- then reference the cached columns in the spread CASE below. Critical
--- for performance: otherwise Postgres re-invokes polgb_curve_at multiple
--- times per row and the view times out on PostgREST (HTTP 500). Same
--- consideration drove the refactor of v_bgk_auction_spread below.
-enriched AS (
+-- then reference the cached columns in the spread CASE below. The
+-- AS MATERIALIZED hint is required: without it the planner inlines
+-- the STABLE polgb_*_interp calls into the outer SELECT, defeating
+-- the cache and causing HTTP 500 timeouts on PostgREST select=*.
+enriched AS MATERIALIZED (
     SELECT
         b.*,
         CASE
