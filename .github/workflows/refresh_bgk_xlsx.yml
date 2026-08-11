@@ -34,9 +34,12 @@ jobs:
           # Supabase target (shared with CETO_DOWNLOADER, bgk_* prefix).
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # ScrapingBee handles Cloudflare Turnstile bypass for bgk.pl
-          # (residential proxy + JS render); plain requests / curl_cffi /
-          # Playwright stealth all failed from Azure IPs.
+          # Scraper-API provider chain handles Cloudflare Turnstile bypass
+          # for bgk.pl (Polish residential exit IPs); plain requests /
+          # curl_cffi / Playwright stealth all failed from Azure IPs.
+          # Order: scrape.do -> ScrapingAnt -> ScrapingBee (legacy).
+          SCRAPEDO_TOKEN: ${{ secrets.SCRAPEDO_TOKEN }}
+          SCRAPINGANT_API_KEY: ${{ secrets.SCRAPINGANT_API_KEY }}
           SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_xlsx.py
 

@@ -110,7 +110,10 @@ def parse_komunikaty_listing(html: str) -> list[dict]:
         if not href:
             continue
         # Skip pre-auction announcement PDFs - no result data inside.
-        if "Informacja_o_przetargu" in href:
+        # Two naming vintages: "Informacja_o_przetargu_*" and (since 2026-08)
+        # "Komunikat_o_przetargu_*". NB the legacy results PDF
+        # "Komunikat_FPC0630_-_wyniki_*" must NOT match here.
+        if "Informacja_o_przetargu" in href or "Komunikat_o_przetargu" in href:
             continue
         url = BGK_BASE + href if href.startswith("/") else href
         if url in seen:

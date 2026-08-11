@@ -18,7 +18,9 @@ on:
   schedule:
     # 22:00 UTC = 23:00 Warsaw (winter, CET) / 24:00 (summer, CEST).
     # 1h DST drift is fine - BGK PDFs are live by midday on auction days.
-    - cron: "0 22 * * *"
+    # Weekdays only: BGK never auctions (or publishes PDFs) on weekends,
+    # so Sat/Sun runs would just burn scraper-API credits on no-ops.
+    - cron: "0 22 * * 1-5"
   workflow_dispatch: {}
 
 permissions:
@@ -53,6 +55,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPEDO_TOKEN: ${{ secrets.SCRAPEDO_TOKEN }}
+          SCRAPINGANT_API_KEY: ${{ secrets.SCRAPINGANT_API_KEY }}
           SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_pdfs.py
 
@@ -99,6 +103,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPEDO_TOKEN: ${{ secrets.SCRAPEDO_TOKEN }}
+          SCRAPINGANT_API_KEY: ${{ secrets.SCRAPINGANT_API_KEY }}
           SCRAPINGBEE_API_KEY: ${{ secrets.SCRAPINGBEE_API_KEY }}
         run: python scripts/refresh_bgk_xlsx.py
 

@@ -277,7 +277,7 @@ def _print_summary(rows: list[dict]) -> None:
 
 
 def main() -> None:
-    print("[1/3] Fetching BGK XLSX via headless Chromium (Cloudflare bypass)...",
+    print("[1/3] Fetching BGK XLSX (CF bypass via provider chain)...",
           flush=True)
     xlsx, url, _snapshot = fetch_bgk_xlsx()
 
